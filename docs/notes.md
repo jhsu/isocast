@@ -4403,6 +4403,20 @@ each section. Delete entries that stop being true.
   it in before). Run with `ISOCAST_DAEMON=$PWD/target/debug/isocastd`.
   `clippy -D warnings` still fails on Linux, on dead code in the daemon's
   `diagnostics.rs`/`plugins.rs` and one CLI struct, from macOS-only paths.
+- 2026-10-15 (L.4): Linux cameras use V4L2 through GStreamer's
+  `v4l2deviceprovider` directly (the device monitor prefers PipeWire's,
+  whose camera nodes offer DMA-BUF only). Ids are /dev/v4l/by-id names
+  (stable across reboots and ports), else the /dev/videoN path. Only
+  modes `videoconvert` can turn into NV12 are offered (an IR camera's
+  GREY isn't). MJPEG goes through `jpegdec` (CPU; `nvjpegdec` exists
+  here if it's ever too slow). An idle v4l2loopback offers no capture
+  formats, so it isn't listed until something feeds it.
+- 2026-10-15 (L.4): UVC cameras with `exposure_dynamic_framerate` on (the
+  BRIO here) drop to ~25 fps in a dark room whatever rate is asked. Not
+  a capture bug: check with `v4l2-ctl -d /dev/video0 --list-ctrls`.
+- 2026-10-15 (L.4): `isocast doctor` and `devices` run in the daemon:
+  rebuild `-p isocast-daemon` too (and `isocast restart`), or they run
+  the old code.
 - 2026-10-15 (L.3): Linux audio goes through GStreamer's device monitor
   (PipeWire provider here): ids are `node.name` (stable; `object.serial`
   isn't), only the exact classes `Audio/Source`/`Audio/Sink` (PipeWire

@@ -1235,7 +1235,7 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
   `stop`, `status`, snapshots).
 - [x] **L.3** Microphones and system audio through PipeWire/Pulse, listed
   by `isocast devices`.
-- [ ] **L.4** Cameras through V4L2.
+- [x] **L.4** Cameras through V4L2.
 - [ ] **L.5** Screens through the xdg screen-cast portal and PipeWire.
 - [ ] **L.6** Media files, live H.264/AAC encoders (streaming), JPEG
   monitors, joining takes, the secret store, per-app audio, and leaving
@@ -1251,6 +1251,18 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.4 (2026-10-15): cameras work on Linux through V4L2: `isocast devices`
+  lists them with stable /dev/v4l/by-id ids and every mode (the BRIO's
+  26; its infrared node and an idle v4l2loopback are left out), format
+  choice follows macOS's rules (1080p30 canvas → 1080p30, 1080p60 →
+  720p60, 1080p@5 request → YUYV, impossible sizes list the valid ones),
+  and capture (MJPEG decoded to NV12) records. Verified with Joe's
+  permission on the BRIO (recordings deleted after): 1080p30 HEVC ISO
+  and H.264 program decode clean, 0 dropped, the ISO's 0.2 s start offset
+  plus 4.8 s matches the 5 s take, one frame checked for colour and
+  orientation. The BRIO delivered ~25 fps in a dark room: its
+  `exposure_dynamic_framerate` is on, and the engine held frames.
 
 - L.3 (2026-10-15): microphones, system audio and monitoring work on
   Linux; `isocast devices` lists microphones and outputs (PipeWire's

@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 # VA-API and x264, fragmented MP4/MOV, PipeWire and V4L2.
 gstreamer = "0.25.4"
 gstreamer-app = "0.25.2"
+gstreamer-video = "0.25.4"
 isocast-engine = { path = "../isocast-engine" }
 isocast-protocol = { path = "../isocast-protocol" }
 # Its portable stand-in until Linux shares surfaces (DMA-BUF).

@@ -2,31 +2,21 @@
 //! (the default output's monitor) captured as interleaved `f32` at
 //! [`SAMPLE_RATE`], and monitoring played on an output device.
 //!
-//! Pipelines run on GStreamer's system clock, which is `CLOCK_MONOTONIC`
-//! like the engine's, so a buffer's capture time is the pipeline's base
-//! time plus its running time.
+//! Capture times come from [`crate::pipeline::capture_time`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use isocast_engine::{AudioRender, AudioSink, SAMPLE_RATE, Time};
+use isocast_engine::{AudioRender, AudioSink, SAMPLE_RATE};
 
 use crate::devices;
+use crate::pipeline::{Running, make};
 
 /// Samples handed to an output device at a time: 10 ms.
 const PLAYBACK_CHUNK: usize = SAMPLE_RATE as usize / 100;
-
-fn make(name: &str) -> Result<gst::Element> {
-    crate::writer::init()?;
-    gst::ElementFactory::make(name)
-        .build()
-        .with_context(|| format!("the GStreamer element {name} is missing"))
-}
 
 fn raw_caps(channels: u32) -> gst::Caps {
     gst::Caps::builder("audio/x-raw")
@@ -35,68 +25,6 @@ fn raw_caps(channels: u32) -> gst::Caps {
         .field("rate", SAMPLE_RATE as i32)
         .field("channels", channels as i32)
         .build()
-}
-
-/// A running pipeline, and the thread watching it for errors. Dropping it
-/// stops both.
-pub struct Running {
-    pipeline: gst::Pipeline,
-    stop: Arc<AtomicBool>,
-    watch: Option<JoinHandle<()>>,
-}
-
-impl Running {
-    /// Start `pipeline` on the monotonic clock, calling `stopped` if it
-    /// fails or ends on its own.
-    fn start(
-        pipeline: gst::Pipeline,
-        what: String,
-        stopped: Box<dyn Fn(String) + Send + Sync>,
-    ) -> Result<Self> {
-        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
-        pipeline
-            .set_state(gst::State::Playing)
-            .with_context(|| format!("could not start {what}"))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let bus = pipeline.bus().expect("pipelines have a bus");
-        let watch = {
-            let stop = stop.clone();
-            thread::Builder::new()
-                .name(format!("isocast {what}"))
-                .spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let Some(message) = bus.timed_pop_filtered(
-                            gst::ClockTime::from_mseconds(100),
-                            &[gst::MessageType::Error, gst::MessageType::Eos],
-                        ) else {
-                            continue;
-                        };
-                        match message.view() {
-                            gst::MessageView::Error(err) => {
-                                stopped(format!("{what} failed: {}", err.error()));
-                            }
-                            _ => stopped(format!("{what} ended")),
-                        }
-                        return;
-                    }
-                })?
-        };
-        Ok(Self {
-            pipeline,
-            stop,
-            watch: Some(watch),
-        })
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = self.pipeline.set_state(gst::State::Null);
-        if let Some(watch) = self.watch.take() {
-            let _ = watch.join();
-        }
-    }
 }
 
 /// Capture from `source`, converted to `channels` interleaved `f32` at
@@ -121,7 +49,7 @@ fn capture(source: gst::Element, channels: u32, sink: AudioSink, what: String) -
                 let (Some(buffer), Some(pipeline)) = (sample.buffer(), clock_of.upgrade()) else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
-                let (Some(pts), Some(base)) = (buffer.pts(), pipeline.base_time()) else {
+                let Some(captured) = crate::pipeline::capture_time(&pipeline, buffer) else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
@@ -131,7 +59,6 @@ fn capture(source: gst::Element, channels: u32, sink: AudioSink, what: String) -
                     .iter()
                     .map(|bytes| f32::from_le_bytes(*bytes))
                     .collect();
-                let captured = Time::from_nanos((base + pts).nseconds() as i64);
                 samples(&values, captured);
                 Ok(gst::FlowSuccess::Ok)
             })
