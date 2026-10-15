@@ -20,6 +20,12 @@ pub(crate) fn make(name: &str) -> Result<gst::Element> {
         .with_context(|| format!("the GStreamer element {name} is missing"))
 }
 
+/// A new pipeline, GStreamer started first.
+pub(crate) fn new() -> Result<gst::Pipeline> {
+    crate::writer::init()?;
+    Ok(gst::Pipeline::new())
+}
+
 /// When `buffer` (from a live source in `pipeline`) was captured, on the
 /// engine's clock.
 pub(crate) fn capture_time(pipeline: &gst::Pipeline, buffer: &gst::BufferRef) -> Option<Time> {

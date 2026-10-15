@@ -30,7 +30,7 @@ fn raw_caps(channels: u32) -> gst::Caps {
 /// Capture from `source`, converted to `channels` interleaved `f32` at
 /// [`SAMPLE_RATE`], into `sink`.
 fn capture(source: gst::Element, channels: u32, sink: AudioSink, what: String) -> Result<Running> {
-    let pipeline = gst::Pipeline::new();
+    let pipeline = crate::pipeline::new()?;
     let convert = make("audioconvert")?;
     let resample = make("audioresample")?;
     let appsink = gst_app::AppSink::builder()
@@ -104,7 +104,7 @@ pub fn play_audio(query: &str, render: AudioRender) -> Result<(Running, String)>
         .device
         .create_element(None)
         .with_context(|| format!("could not open {:?}", found.name))?;
-    let pipeline = gst::Pipeline::new();
+    let pipeline = crate::pipeline::new()?;
     let appsrc = gst_app::AppSrc::builder()
         .caps(&raw_caps(2))
         .format(gst::Format::Time)

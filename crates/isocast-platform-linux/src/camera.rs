@@ -409,7 +409,7 @@ pub fn capture_camera(
             mode.height
         );
     }
-    let pipeline = gst::Pipeline::new();
+    let pipeline = crate::pipeline::new()?;
     let source = make("v4l2src")?;
     source.set_property("device", found.path.to_string_lossy().as_ref());
     let filter = make("capsfilter")?;

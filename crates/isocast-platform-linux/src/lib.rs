@@ -30,9 +30,11 @@ use isocast_protocol::{Canvas, SourceKind};
 mod audio;
 mod camera;
 mod devices;
+mod displays;
 pub mod frames;
 mod gpu;
 mod pipeline;
+mod screen;
 mod system;
 mod writer;
 
@@ -54,6 +56,7 @@ fn not_yet<T>(what: &str, task: &str) -> anyhow::Result<T> {
 pub enum Capture {
     Audio(pipeline::Running),
     Camera(pipeline::Running),
+    Screen(screen::ScreenCapture),
 }
 
 /// Audio playing on an output device. Dropping it stops playback.
@@ -163,14 +166,19 @@ impl Platform for LinuxPlatform {
     }
 
     fn devices(&self) -> anyhow::Result<Devices> {
+        let mut notes =
+            vec!["windows can't be listed on Linux: the portal picks them (PLAN.md L.6)".into()];
+        let displays = displays::displays().unwrap_or_else(|err| {
+            notes.push(format!("{err:#}"));
+            Vec::new()
+        });
         Ok(Devices {
+            displays,
             cameras: camera::cameras()?,
             microphones: devices::microphones()?,
             audio_outputs: devices::audio_outputs()?,
             permissions: permissions_report().permissions,
-            notes: vec![
-                "listing displays and windows isn't supported on Linux yet (PLAN.md L.5)".into(),
-            ],
+            notes,
             ..Devices::default()
         })
     }
@@ -205,8 +213,20 @@ impl Platform for LinuxPlatform {
 
     fn probe(&self, source: &SourceKind, canvas: &Canvas) -> anyhow::Result<Option<Probe>> {
         match source {
-            SourceKind::Display(_) | SourceKind::Window(_) | SourceKind::Application(_) => {
-                not_yet("screen capture", "L.5")
+            SourceKind::Display(settings) => {
+                let display = displays::find(&settings.display)?;
+                Ok(Some(Probe {
+                    device: display.name,
+                    video: Some(CaptureFormat {
+                        width: display.width,
+                        height: display.height,
+                        fps: canvas.fps,
+                    }),
+                    channels: None,
+                }))
+            }
+            SourceKind::Window(_) | SourceKind::Application(_) => {
+                not_yet("window and app capture", "L.6")
             }
             SourceKind::Camera(settings) => {
                 let request = CameraRequest {
@@ -290,13 +310,17 @@ impl Platform for LinuxPlatform {
 
     fn capture_screen(
         &self,
-        _target: ScreenTarget<'_>,
-        _fps: u32,
+        target: ScreenTarget<'_>,
+        fps: u32,
         _ten_bit: bool,
-        _cursor: bool,
-        _sink: VideoSink<Frame>,
+        cursor: bool,
+        sink: VideoSink<Frame>,
     ) -> anyhow::Result<(Capture, CaptureFormat)> {
-        not_yet("screen capture", "L.5")
+        let ScreenTarget::Display(display) = target else {
+            return not_yet("window and app capture", "L.6");
+        };
+        let (capture, format) = screen::capture_display(display, fps, cursor, sink)?;
+        Ok((Capture::Screen(capture), format))
     }
 
     fn capture_camera(

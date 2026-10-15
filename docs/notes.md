@@ -301,6 +301,12 @@ each section. Delete entries that stop being true.
 
 ## Ready for Ryan
 
+- 2026-10-15 (L.1–L.5): **Isocast records on Linux** (Joe's CachyOS + niri,
+  RTX 4070 Ti SUPER): screens, cameras, microphones, system audio and
+  synthetic sources, in-process and through the daemon. Needs GStreamer
+  with `gst-libav` (AAC). Try: `cargo build && ISOCAST_DAEMON=$PWD/target/debug/isocastd
+  ./target/debug/isocast record --source screen --source mic --seconds 10`.
+
 - 2026-10-14 (8.2): **Isocast 0.0.2 is published**, the first release that
   updates itself: https://github.com/R44VC0RP/isocast/releases/tag/v0.0.2
   (full release, Latest). Built locally from main 33b9b73 (public snapshot
@@ -4403,6 +4409,28 @@ each section. Delete entries that stop being true.
   it in before). Run with `ISOCAST_DAEMON=$PWD/target/debug/isocastd`.
   `clippy -D warnings` still fails on Linux, on dead code in the daemon's
   `diagnostics.rs`/`plugins.rs` and one CLI struct, from macOS-only paths.
+- 2026-10-15 (L.5): Linux screens go through the ScreenCast portal
+  (`ashpd`, a 1-thread tokio runtime per session). The portal can't list
+  displays, so they come from `wl_output` 4 (id = connector, like DP-3).
+  Restore tokens (single-use: every start returns a new one) are kept by
+  display id in ~/.isocast/linux-screencast.json; delete it to see the
+  picker again. Window/app capture is L.6.
+- 2026-10-15 (L.5): niri on NVIDIA offers screen-cast buffers only as
+  DMA-BUFs in a tiled layout (XR24, modifier 0x0300000000606012): no
+  ordinary memory, no linear. `glupload` imports them through EGL;
+  `glcolorconvert` to BGRA and `gldownload` copy them out. Also covers
+  compositors offering ordinary memory. Zero-copy (into wgpu) would
+  remove the round trip.
+- 2026-10-15 (L.5): `pipewiresrc` timestamps from niri don't advance
+  (every buffer keeps the first one's pts), and `do-timestamp` doesn't
+  override a set pts. A probe before `glupload` stamps each frame with
+  the running time on arrival (a few ms after the compositor drew it) and
+  passes the first after each 1/fps tick (144 Hz display → steady 60).
+- 2026-10-15 (L.5): the engine treats an RGB frame's alpha as real
+  ("captures are opaque" only for Y'CbCr), so BGRx's fourth byte must be
+  255; screen frames get it set while copied out.
+- 2026-10-15 (L.5): `isocast-platform-linux` is built at opt-level 3 in
+  dev (workspace Cargo.toml): it copies every captured frame.
 - 2026-10-15 (L.4): Linux cameras use V4L2 through GStreamer's
   `v4l2deviceprovider` directly (the device monitor prefers PipeWire's,
   whose camera nodes offer DMA-BUF only). Ids are /dev/v4l/by-id names

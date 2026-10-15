@@ -1236,10 +1236,11 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 - [x] **L.3** Microphones and system audio through PipeWire/Pulse, listed
   by `isocast devices`.
 - [x] **L.4** Cameras through V4L2.
-- [ ] **L.5** Screens through the xdg screen-cast portal and PipeWire.
+- [x] **L.5** Screens through the xdg screen-cast portal and PipeWire.
 - [ ] **L.6** Media files, live H.264/AAC encoders (streaming), JPEG
-  monitors, joining takes, the secret store, per-app audio, and leaving
-  our own monitoring out of system audio.
+  monitors, joining takes, the secret store, per-app audio, leaving our
+  own monitoring out of system audio, and windows and apps (the portal
+  picks them; setups name them by app and title).
 
 ### 9. Later (pull into the queue once the above is done)
 
@@ -1251,6 +1252,16 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.5 (2026-10-15): displays record on Linux through the ScreenCast
+  portal: `isocast devices` lists them from Wayland's outputs, the
+  portal's dialog shows once and its restore token skips it after, and
+  niri's tiled NVIDIA DMA-BUFs go through OpenGL to BGRA. Verified with
+  Joe picking the LG monitor (recordings deleted after): 3840×2160 HEVC
+  at 60 fps, 6.000 s, 0 dropped, ~55 new frames a second (the rest an
+  unchanged screen), a full decode clean and one frame checked; through
+  the daemon too, with no dialog, a snapshot and a tone track; ~55% of
+  one core in a debug build.
 
 - L.4 (2026-10-15): cameras work on Linux through V4L2: `isocast devices`
   lists them with stable /dev/v4l/by-id ids and every mode (the BRIO's

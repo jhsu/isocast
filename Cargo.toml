@@ -29,6 +29,11 @@ repository = "https://github.com/R44VC0RP/isocast"
 [profile.dev.package.nnnoiseless]
 opt-level = 3
 
+# The Linux back end copies every captured frame (a 4K screen is 33 MB):
+# unoptimised, its pixel loops can't keep up at 60 fps.
+[profile.dev.package.isocast-platform-linux]
+opt-level = 3
+
 [profile.dev.package.easyfft]
 opt-level = 3
 

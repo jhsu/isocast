@@ -8,6 +8,9 @@ description = "Linux back end for Isocast: monotonic clock, wgpu frames, GStream
 
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow = "1.0.104"
+# The xdg-desktop-portal ScreenCast session for screens (Wayland).
+ashpd = { version = "0.13.13", features = ["screencast"] }
+enumflags2 = "0.7"
 # Encoding and muxing (later capture too): one stable C API for NVENC,
 # VA-API and x264, fragmented MP4/MOV, PipeWire and V4L2.
 gstreamer = "0.25.4"
@@ -18,5 +21,10 @@ isocast-protocol = { path = "../isocast-protocol" }
 # Its portable stand-in until Linux shares surfaces (DMA-BUF).
 isocast-surfaces = { path = "../isocast-surfaces" }
 libc = "0.2"
+# The portal session runs on its own small runtime.
+serde_json = "1.0.154"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# Displays, listed from the compositor's outputs.
+wayland-client = "0.31.15"
 # Pinned like the engine's.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
