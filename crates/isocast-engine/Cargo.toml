@@ -33,3 +33,8 @@ native-tls = "0.2.18"
 wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 # Pinned: the frame import uses wgpu-hal APIs, which change between releases.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+
+# Linux has no Metal: the compositor runs on Vulkan. Without this the
+# daemon only got a backend when Slint (the UI) was in the same build.
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan"] }

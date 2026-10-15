@@ -862,7 +862,7 @@ fn process_cpu_seconds() -> Option<f64> {
     }
     // SAFETY: filled in by getrusage above.
     let usage = unsafe { usage.assume_init() };
-    let seconds = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1e6;
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
 }
 
@@ -3926,8 +3926,32 @@ fn free_bytes(_folder: &Path) -> Option<u64> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn doctor(setup: Option<&Setup>, folder: Option<&Path>) -> isocast_protocol::api::Doctor {
     isocast_engine::doctor::doctor(&MacPlatform, setup, folder)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn doctor(_setup: Option<&Setup>, _folder: Option<&Path>) -> isocast_protocol::api::Doctor {
+    use isocast_protocol::api::{Check, CheckStatus, Doctor, Machine};
+    Doctor {
+        machine: Machine {
+            chip: String::new(),
+            memory_gb: 0.0,
+            cores: thread::available_parallelism().map_or(0, |n| n.get() as u32),
+            os: std::env::consts::OS.into(),
+            hardware_encoders: Vec::new(),
+        },
+        checks: vec![Check {
+            name: "platform".into(),
+            status: CheckStatus::Problem,
+            detail: format!(
+                "recording only runs on macOS so far, not {}",
+                std::env::consts::OS
+            ),
+            fix: None,
+        }],
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -4383,6 +4383,15 @@ each section. Delete entries that stop being true.
 
 ## Gotchas
 
+- 2026-10-15: Linux builds. `isocastd` compiles and serves the socket;
+  `setup check`, `status` and `doctor` work, while recording, devices,
+  permissions, snapshots and tune bail with "macOS so far". The engine
+  enables wgpu's `vulkan` on Linux (only Slint brought it in before, so
+  `-p isocast-daemon` had no backend). Run with
+  `ISOCAST_DAEMON=$PWD/target/debug/isocastd`. `clippy -D warnings` still
+  fails on Linux: 14 dead-code/unused warnings in the daemon's
+  `diagnostics.rs` and `plugins.rs`, from macOS-only paths. A Linux
+  `Platform` backend is still to come.
 - 2026-10-14 (#47 fix round): building a `git archive` of main into the
   same CARGO_TARGET_DIR (for "before" screenshots) left main's
   isocast-protocol/diagnostics artifacts in place; the branch then failed

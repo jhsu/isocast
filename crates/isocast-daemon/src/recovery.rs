@@ -149,7 +149,7 @@ impl Daemon {
             })
             .collect::<Vec<_>>();
         #[cfg(not(target_os = "macos"))]
-        let recovered = Vec::new();
+        let mut recovered: Vec<isocast_protocol::manifest::InterruptedRecording> = Vec::new();
         recovered.sort_by(|a, b| b.recording.started_at.cmp(&a.recording.started_at));
         recovered.truncate(20);
         for take in recovered.iter().filter(|r| r.newly_detected) {
