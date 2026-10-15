@@ -1231,7 +1231,7 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
   pools, a wgpu importer, a GStreamer file writer (NVENC, else x264; AAC),
   volume and machine info. Done when `ffprobe` shows the expected codec,
   size, rate and duration for the program and ISO files.
-- [ ] **L.2** The daemon runs the live engine on Linux (`isocast start`,
+- [x] **L.2** The daemon runs the live engine on Linux (`isocast start`,
   `stop`, `status`, snapshots).
 - [ ] **L.3** Microphones and system audio through PipeWire/Pulse, listed
   by `isocast devices`.
@@ -1250,6 +1250,14 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.2 (2026-10-15): isocastd runs the live engine on Linux: `start`,
+  `status` (counters and levels), `snapshot` (program, source, scene),
+  `marker`, `split` and `stop`, plus doctor, tune, recovery, joins and
+  OBS import sizes through the same platform. Verified with the scratch
+  setup through the daemon: 2 takes (17 s + 2 s, 0 dropped), every file
+  decodes clean, program beeps on its flashes at 0.0 ms over 17 s, ISO a
+  constant half frame (30 fps grid), snapshots correct.
 
 - L.1 (2026-10-15): `isocast record` works on Linux for synthetic sources:
   program (composited) and ISO files, H.264/HEVC through NVENC with AAC,

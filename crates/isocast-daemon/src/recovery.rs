@@ -141,14 +141,12 @@ impl Daemon {
             .collect();
         folders.sort();
         folders.dedup();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let mut recovered = folders
             .iter()
-            .flat_map(|p| {
-                isocast_engine::record::recover_interrupted(&isocast_platform_macos::MacPlatform, p)
-            })
+            .flat_map(|p| isocast_engine::record::recover_interrupted(&crate::Native, p))
             .collect::<Vec<_>>();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let mut recovered: Vec<isocast_protocol::manifest::InterruptedRecording> = Vec::new();
         recovered.sort_by(|a, b| b.recording.started_at.cmp(&a.recording.started_at));
         recovered.truncate(20);

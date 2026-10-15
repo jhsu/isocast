@@ -52,8 +52,6 @@ pub enum MediaReader {}
 pub enum Playback {}
 pub enum VideoEncoder {}
 pub enum AudioEncoder {}
-#[derive(Clone)]
-pub enum SharedSurface {}
 
 impl isocast_engine::MediaReader for MediaReader {
     type Frame = Frame;
@@ -146,7 +144,7 @@ impl Platform for LinuxPlatform {
     type Playback = Playback;
     type VideoEncoder = VideoEncoder;
     type AudioEncoder = AudioEncoder;
-    type SharedSurface = SharedSurface;
+    type SharedSurface = isocast_surfaces::Surface;
 
     fn now(&self) -> Time {
         host_time()
@@ -234,7 +232,7 @@ impl Platform for LinuxPlatform {
         _gpu: &Gpu,
         _width: u32,
         _height: u32,
-    ) -> anyhow::Result<(SharedSurface, wgpu::Texture)> {
+    ) -> anyhow::Result<(isocast_surfaces::Surface, wgpu::Texture)> {
         not_yet("live monitors in other apps", "L.6")
     }
 

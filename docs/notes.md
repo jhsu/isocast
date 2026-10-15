@@ -4394,11 +4394,12 @@ each section. Delete entries that stop being true.
 
 ## Gotchas
 
-- 2026-10-15: Linux builds. `isocastd` compiles and serves the socket;
-  `setup check`, `status` and `doctor` work, while recording in the
-  daemon, devices, permissions, snapshots and tune bail with "macOS so
-  far" (L.2). `isocast record` (in-process) records synthetic sources
-  (L.1). The engine enables wgpu's `vulkan` on Linux (only Slint brought
+- 2026-10-15: Linux builds, and records synthetic sources in-process
+  (`isocast record`, L.1) and in the daemon (`isocast start`, L.2). The
+  daemon reaches the platform through `Native` (main.rs), MacPlatform or
+  LinuxPlatform; macOS-only parts (AppKit main queue, plugin sandbox,
+  hotkeys, diagnostics samplers) keep their macOS gates. `isocast start
+  <setup>` replaces the live setup in ~/.isocast (a .bak is kept). The engine enables wgpu's `vulkan` on Linux (only Slint brought
   it in before). Run with `ISOCAST_DAEMON=$PWD/target/debug/isocastd`.
   `clippy -D warnings` still fails on Linux, on dead code in the daemon's
   `diagnostics.rs`/`plugins.rs` and one CLI struct, from macOS-only paths.

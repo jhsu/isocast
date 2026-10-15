@@ -33,6 +33,8 @@ fn since_file() -> PathBuf {
 pub(crate) fn start(daemon: &Daemon) {
     #[cfg(target_os = "macos")]
     isocast_engine::trace::set_clock(isocast_platform_macos::host_time);
+    #[cfg(target_os = "linux")]
+    isocast_engine::trace::set_clock(isocast_platform_linux::host_time);
     sync(daemon, "loaded");
 }
 
