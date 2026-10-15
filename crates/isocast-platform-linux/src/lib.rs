@@ -27,6 +27,8 @@ use isocast_protocol::devices::{
 };
 use isocast_protocol::{Canvas, SourceKind};
 
+mod audio;
+mod devices;
 pub mod frames;
 mod gpu;
 mod system;
@@ -45,11 +47,17 @@ fn not_yet<T>(what: &str, task: &str) -> anyhow::Result<T> {
     bail!("{what} isn't supported on Linux yet (PLAN.md {task})")
 }
 
+/// A running capture of any kind. Dropping it stops the capture.
+pub enum Capture {
+    Audio(audio::Running),
+}
+
+/// Audio playing on an output device. Dropping it stops playback.
+pub type Playback = audio::Running;
+
 /// Uninhabited stand-ins for what this back end can't make yet: no value
 /// of them exists, so their trait methods can never run.
-pub enum Capture {}
 pub enum MediaReader {}
-pub enum Playback {}
 pub enum VideoEncoder {}
 pub enum AudioEncoder {}
 
@@ -152,8 +160,13 @@ impl Platform for LinuxPlatform {
 
     fn devices(&self) -> anyhow::Result<Devices> {
         Ok(Devices {
+            microphones: devices::microphones()?,
+            audio_outputs: devices::audio_outputs()?,
             permissions: permissions_report().permissions,
-            notes: vec!["listing devices isn't supported on Linux yet (PLAN.md L.3–L.5)".into()],
+            notes: vec![
+                "listing displays, windows and cameras isn't supported on Linux yet (PLAN.md L.4–L.5)"
+                    .into(),
+            ],
             ..Devices::default()
         })
     }
@@ -192,9 +205,20 @@ impl Platform for LinuxPlatform {
                 not_yet("screen capture", "L.5")
             }
             SourceKind::Camera(_) => not_yet("camera capture", "L.4"),
-            SourceKind::Microphone(_)
-            | SourceKind::SystemAudio(_)
-            | SourceKind::ApplicationAudio(_) => not_yet("audio capture", "L.3"),
+            SourceKind::Microphone(settings) => {
+                let found = devices::find("Audio/Source", "microphone", &settings.device)?;
+                Ok(Some(Probe {
+                    channels: Some(devices::channels(&found.device)),
+                    device: found.name,
+                    video: None,
+                }))
+            }
+            SourceKind::SystemAudio(_) => Ok(Some(Probe {
+                device: "system audio".into(),
+                video: None,
+                channels: Some(2),
+            })),
+            SourceKind::ApplicationAudio(_) => not_yet("application audio capture", "L.6"),
             _ => Ok(None),
         }
     }
@@ -270,28 +294,22 @@ impl Platform for LinuxPlatform {
         not_yet("camera capture", "L.4")
     }
 
-    fn capture_microphone(
-        &self,
-        _device: &str,
-        _sink: AudioSink,
-    ) -> anyhow::Result<(Capture, u32)> {
-        not_yet("microphone capture", "L.3")
+    fn capture_microphone(&self, device: &str, sink: AudioSink) -> anyhow::Result<(Capture, u32)> {
+        let (capture, channels) = audio::capture_microphone(device, sink)?;
+        Ok((Capture::Audio(capture), channels))
     }
 
     fn capture_system_audio(
         &self,
-        _sink: AudioSink,
+        sink: AudioSink,
         _exclude_own: bool,
     ) -> anyhow::Result<(Capture, u32)> {
-        not_yet("system audio capture", "L.3")
+        let (capture, channels) = audio::capture_system_audio(sink)?;
+        Ok((Capture::Audio(capture), channels))
     }
 
-    fn play_audio(
-        &self,
-        _device: &str,
-        _render: AudioRender,
-    ) -> anyhow::Result<(Playback, String)> {
-        not_yet("audio monitoring", "L.3")
+    fn play_audio(&self, device: &str, render: AudioRender) -> anyhow::Result<(Playback, String)> {
+        audio::play_audio(device, render)
     }
 
     fn capture_browser(
@@ -308,7 +326,7 @@ impl Platform for LinuxPlatform {
         _app: &str,
         _sink: AudioSink,
     ) -> anyhow::Result<(Capture, u32)> {
-        not_yet("application audio capture", "L.3")
+        not_yet("application audio capture", "L.6")
     }
 
     fn create_video_encoder(&self, _spec: &LiveVideoSpec) -> anyhow::Result<VideoEncoder> {

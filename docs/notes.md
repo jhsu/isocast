@@ -4403,6 +4403,20 @@ each section. Delete entries that stop being true.
   it in before). Run with `ISOCAST_DAEMON=$PWD/target/debug/isocastd`.
   `clippy -D warnings` still fails on Linux, on dead code in the daemon's
   `diagnostics.rs`/`plugins.rs` and one CLI struct, from macOS-only paths.
+- 2026-10-15 (L.3): Linux audio goes through GStreamer's device monitor
+  (PipeWire provider here): ids are `node.name` (stable; `object.serial`
+  isn't), only the exact classes `Audio/Source`/`Audio/Sink` (PipeWire
+  also lists raw ALSA nodes as `…/Internal`), and capture uses the
+  device's own element (`pipewiresrc` here). System audio is `pulsesrc
+  device=@DEFAULT_MONITOR@` (pipewire-pulse), which includes our own
+  monitoring: `exclude_own` is ignored until L.6. Pipelines run on
+  `gst::SystemClock` (monotonic), so capture time = base time + pts.
+  Monitoring round trip through a null sink measured 127 ms.
+- 2026-10-15 (L.3): to test audio without sound or touching defaults:
+  `pactl load-module module-null-sink sink_name=isocast_test`, then
+  `module-remap-source master=isocast_test.monitor source_name=...`
+  (add `channels=1 channel_map=mono` for mono); monitor a tone to the
+  sink and record the remapped source; `pactl unload-module` after.
 - 2026-10-15 (L.1): wgpu devices from different `Instance`s can compare
   equal (ids collide across instances), and each engine thread with its
   own `Gpu` has its own instance. Keying a frame's cached textures by

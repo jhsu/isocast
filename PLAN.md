@@ -1233,12 +1233,13 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
   size, rate and duration for the program and ISO files.
 - [x] **L.2** The daemon runs the live engine on Linux (`isocast start`,
   `stop`, `status`, snapshots).
-- [ ] **L.3** Microphones and system audio through PipeWire/Pulse, listed
+- [x] **L.3** Microphones and system audio through PipeWire/Pulse, listed
   by `isocast devices`.
 - [ ] **L.4** Cameras through V4L2.
 - [ ] **L.5** Screens through the xdg screen-cast portal and PipeWire.
 - [ ] **L.6** Media files, live H.264/AAC encoders (streaming), JPEG
-  monitors, joining takes, the secret store.
+  monitors, joining takes, the secret store, per-app audio, and leaving
+  our own monitoring out of system audio.
 
 ### 9. Later (pull into the queue once the above is done)
 
@@ -1250,6 +1251,17 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.3 (2026-10-15): microphones, system audio and monitoring work on
+  Linux; `isocast devices` lists microphones and outputs (PipeWire's
+  stable `node.name` ids). Verified with temporary virtual devices (a
+  null sink and remapped stereo and mono sources, removed after; the
+  defaults untouched): the tone monitored to the sink comes back in the
+  mic's ISO track 127 ms later (the round trip), mono gives a 1-channel
+  track, system audio a valid stereo track; a burst played at a logged
+  CLOCK_MONOTONIC time is captured 118 ms after `paplay` launched, so
+  capture times are right; through the daemon, status shows levels and
+  "beep on Isocast-Test-Sink, 0 underruns".
 
 - L.2 (2026-10-15): isocastd runs the live engine on Linux: `start`,
   `status` (counters and levels), `snapshot` (program, source, scene),
