@@ -1447,6 +1447,17 @@ each section. Delete entries that stop being true.
 
 ## Decisions
 
+- 2026-10-15 (Joe, L): **Linux backend on GStreamer** (`gstreamer-rs`
+  0.25): capture, NVENC/VA-API/x264 encoding and fragmented MOV/MP4 in
+  one stable C API. The system FFmpeg (libavcodec 63) is newer than the
+  Rust FFmpeg bindings, whose API breaks between majors. Needs
+  `gst-libav` for AAC (`avenc_aac`) and `gst-plugin-va` for Intel/AMD.
+  Frames are CPU pixels or textures, with a version per copy; writers
+  copy GPU frames back (the engine waits for its GPU work before handing
+  frames on). DMA-BUF zero-copy later. 10-bit and ProRes refuse with
+  the valid options. Encoder quality 1–100 maps to a quantiser
+  `40 - q/4` (NVENC VBR const-quality, x264 CRF, VA CQP).
+
 - 2026-10-14 (Ryan): **reading OBS source is allowed; copying it isn't.**
   Agents may clone OBS Studio and its plugins outside the repo and read them
   to understand behaviour and compatibility. Nothing from them is copied,
@@ -4384,14 +4395,32 @@ each section. Delete entries that stop being true.
 ## Gotchas
 
 - 2026-10-15: Linux builds. `isocastd` compiles and serves the socket;
-  `setup check`, `status` and `doctor` work, while recording, devices,
-  permissions, snapshots and tune bail with "macOS so far". The engine
-  enables wgpu's `vulkan` on Linux (only Slint brought it in before, so
-  `-p isocast-daemon` had no backend). Run with
-  `ISOCAST_DAEMON=$PWD/target/debug/isocastd`. `clippy -D warnings` still
-  fails on Linux: 14 dead-code/unused warnings in the daemon's
-  `diagnostics.rs` and `plugins.rs`, from macOS-only paths. A Linux
-  `Platform` backend is still to come.
+  `setup check`, `status` and `doctor` work, while recording in the
+  daemon, devices, permissions, snapshots and tune bail with "macOS so
+  far" (L.2). `isocast record` (in-process) records synthetic sources
+  (L.1). The engine enables wgpu's `vulkan` on Linux (only Slint brought
+  it in before). Run with `ISOCAST_DAEMON=$PWD/target/debug/isocastd`.
+  `clippy -D warnings` still fails on Linux, on dead code in the daemon's
+  `diagnostics.rs`/`plugins.rs` and one CLI struct, from macOS-only paths.
+- 2026-10-15 (L.1): wgpu devices from different `Instance`s can compare
+  equal (ids collide across instances), and each engine thread with its
+  own `Gpu` has its own instance. Keying a frame's cached textures by
+  `wgpu::Device` reused the program's textures on the ISO thread
+  ("Cannot get non-existent resource TextureViewId"). Key by importer.
+- 2026-10-15 (L.1): `qtmux` `fragment-mode=first-moov-then-finalise` puts
+  each `mdat` before its `moof` (and the first before the `moov`): a
+  SIGKILLed file won't open. `dash-or-mss` writes standard fragments and
+  survives a kill, losing at most the fragment being written.
+- 2026-10-15 (L.1): `qtmux` 1.28 ignores `GstAudioClippingMeta`, writes
+  audio edit lists from media time 0 when finalising, and none at all in
+  `dash-or-mss`: AAC played 1024 samples (21.3 ms) late. Fixed by
+  dropping the encoder's first (priming) packet and moving the rest
+  earlier; the first 21 ms of each file decode as a slight fade-in.
+- 2026-10-15 (L.1): the CLI needs `#![recursion_limit = "256"]` on Linux:
+  the engine with the Linux platform puts wgpu-core's Vulkan types
+  through deeper Send/Sync checks than the default allows.
+- 2026-10-15 (L.1): the CLI's panic hook keeps panic messages out of the
+  terminal; read them in `~/.isocast/logs/*.jsonl` (component `panic`).
 - 2026-10-14 (#47 fix round): building a `git archive` of main into the
   same CARGO_TARGET_DIR (for "before" screenshots) left main's
   isocast-protocol/diagnostics artifacts in place; the branch then failed

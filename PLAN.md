@@ -1218,6 +1218,28 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
   commit status `isocast/visual-check`. First real run: see "Waiting on
   Ryan" in docs/notes.md.
 
+### L. Linux backend (Joe, 2026-10-15)
+
+`isocast-platform-linux`, GStreamer through `gstreamer-rs` (capture,
+encoding and fragmented MP4/MOV muxing in one stable C API; the system
+FFmpeg, 63.x, is newer than the Rust bindings). Frames are CPU pixels or
+textures the compositor drew; writers copy GPU frames back before encoding.
+Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
+
+- [x] **L.1** `isocast record` with `test_pattern` and `tone` writes a
+  playable fragmented file on Linux: monotonic clock, CPU/GPU frames and
+  pools, a wgpu importer, a GStreamer file writer (NVENC, else x264; AAC),
+  volume and machine info. Done when `ffprobe` shows the expected codec,
+  size, rate and duration for the program and ISO files.
+- [ ] **L.2** The daemon runs the live engine on Linux (`isocast start`,
+  `stop`, `status`, snapshots).
+- [ ] **L.3** Microphones and system audio through PipeWire/Pulse, listed
+  by `isocast devices`.
+- [ ] **L.4** Cameras through V4L2.
+- [ ] **L.5** Screens through the xdg screen-cast portal and PipeWire.
+- [ ] **L.6** Media files, live H.264/AAC encoders (streaming), JPEG
+  monitors, joining takes, the secret store.
+
 ### 9. Later (pull into the queue once the above is done)
 
 - Streaming: RTMP and SRT through FFmpeg or GStreamer, WHIP through `str0m`.
@@ -1228,6 +1250,15 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.1 (2026-10-15): `isocast record` works on Linux for synthetic sources:
+  program (composited) and ISO files, H.264/HEVC through NVENC with AAC,
+  in fragmented MOV/MP4. Verified on an RTX 4070 Ti SUPER with a scratch
+  setup (test pattern at 1280×720@30 in a 1920×1080@60 scene, tone):
+  ffprobe shows h264 1920×1080@60 and hevc 1280×720@30, 6.000 s, 0
+  dropped; full decodes clean; the pattern's flashes and the tone's beeps
+  agree to 0.02 ms; after SIGKILL at ~9 s both files open and play 6.0 s,
+  still in sync.
 
 - A.4 / #41 (2026-10-14, fixed): the cause is VideoToolbox's placement of
   hardware sessions on the M4 Max's two encode engines, decided at each

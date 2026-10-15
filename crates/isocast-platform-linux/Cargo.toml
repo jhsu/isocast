@@ -1,0 +1,19 @@
+[package]
+name = "isocast-platform-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Linux back end for Isocast: monotonic clock, wgpu frames, GStreamer file writing."
+
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow = "1.0.104"
+# Encoding and muxing (later capture too): one stable C API for NVENC,
+# VA-API and x264, fragmented MP4/MOV, PipeWire and V4L2.
+gstreamer = "0.25.4"
+gstreamer-app = "0.25.2"
+isocast-engine = { path = "../isocast-engine" }
+isocast-protocol = { path = "../isocast-protocol" }
+libc = "0.2"
+# Pinned like the engine's.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }

@@ -1,3 +1,7 @@
+// The engine instantiated with the Linux platform puts wgpu-core's Vulkan
+// types through Send/Sync checks deeper than the default limit of 128.
+#![recursion_limit = "256"]
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3511,7 +3515,12 @@ fn record_with_platform(setup: &Setup, options: &RecordOptions) -> Result<Report
     isocast_engine::record::record(&isocast_platform_macos::MacPlatform, setup, options)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn record_with_platform(setup: &Setup, options: &RecordOptions) -> Result<Report> {
+    isocast_engine::record::record(&isocast_platform_linux::LinuxPlatform, setup, options)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn record_with_platform(_setup: &Setup, _options: &RecordOptions) -> Result<Report> {
-    bail!("recording is only supported on macOS so far")
+    bail!("recording is only supported on macOS and Linux so far")
 }
