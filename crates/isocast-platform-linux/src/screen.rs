@@ -39,7 +39,7 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the portal's restore tokens are kept, by display id.
 fn tokens_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".isocast/linux-screencast.json"))
+    Some(isocast_protocol::api::state_folder().join("linux-screencast.json"))
 }
 
 fn load_token(display: &str) -> Option<String> {

@@ -156,7 +156,11 @@ fn main() -> ExitCode {
             return ExitCode::from(result as u8);
         }
     }
+    let adopted = isocast_protocol::api::adopt_legacy_folder();
     let _logs = isocast_diagnostics::init("isocastd", false);
+    for note in adopted {
+        isocast_diagnostics::diagnostic!("isocastd: {note}");
+    }
     let socket = socket_path();
     match hold_instance_lock().and_then(|lock| Ok((lock, listen(&socket)?))) {
         // The lock is held until the process exits.

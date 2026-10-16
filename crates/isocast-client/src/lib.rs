@@ -505,9 +505,12 @@ fn running_daemon() -> Option<String> {
     }
 }
 
-/// The daemon's log, next to its socket and named after it
-/// (`isocastd.sock` → `isocastd.log`), so daemons on sockets of their own
-/// in one folder (`$ISOCAST_SOCKET`) don't share a log.
+/// The daemon's log: `isocastd.log` in the state folder; for a daemon on
+/// a socket of its own (`$ISOCAST_SOCKET`), next to it and named after it
+/// (`x.sock` → `x.log`), so such daemons in one folder don't share a log.
 pub fn log_path() -> PathBuf {
-    socket_path().with_extension("log")
+    if std::env::var_os("ISOCAST_SOCKET").is_some() {
+        return socket_path().with_extension("log");
+    }
+    isocast_protocol::api::state_folder().join("isocastd.log")
 }

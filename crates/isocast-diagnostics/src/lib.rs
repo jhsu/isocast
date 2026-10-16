@@ -78,7 +78,7 @@ pub fn logs_folder() -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Logs/Isocast")
     } else {
-        home.join(".isocast/logs")
+        isocast_protocol::api::state_folder().join("logs")
     }
 }
 

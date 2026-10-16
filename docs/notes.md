@@ -1610,6 +1610,20 @@ each section. Delete entries that stop being true.
 
 ## Decisions
 
+- 2026-10-16 (Linux paths): off macOS, Isocast follows XDG instead of
+  `~/.isocast` (`api::{config,data,state,runtime}_folder`). Config
+  (`~/.config/isocast`): `setup.toml`, the `setup/` library (collections,
+  profiles, `current.toml`), every `setup.*` sidecar and `isocast-ui.json`.
+  Data (`~/.local/share/isocast`): plugins, timelines. State
+  (`~/.local/state/isocast`): `logs/`, `isocastd.log`,
+  `linux-screencast.json`. Runtime (`$XDG_RUNTIME_DIR/isocast`, else the
+  state folder): socket and lock. The `setup/` layout and the `setup.*`
+  sidecars stay beside `setup.toml` because `$ISOCAST_SETUP`/`$ISOCAST_SOCKET`
+  isolation derives them from it. No `dirs` crate: four env lookups.
+  isocastd moves `~/.isocast` over on start (`adopt_legacy_folder`, before
+  logging; folders already there, like the CLI's `logs`, are merged; files
+  already there win; the old socket/lock/log stay for a daemon still
+  running there). macOS paths are unchanged.
 - 2026-10-16 (engine hardening, #27/#30/#31/#35): engine and daemon locks
   use parking_lot. Only selected control state uses `Critical` transactions:
   an unwound mutation marks it broken for emergency finalization; a reader

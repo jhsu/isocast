@@ -1,7 +1,7 @@
 //! The per-viewer layout (the web app keeps it in localStorage): dock
 //! sizes, which docks and bars show, the locks, preview scaling and Studio
 //! Mode; and Settings → General's snapping and preview frame rate. Kept
-//! in `$ISOCAST_UI_PREFS`, else `isocast-ui.json` in Isocast's support
+//! in `$ISOCAST_UI_PREFS`, else `isocast-ui.json` in Isocast's config
 //! folder. Snapshots neither read nor write it, so they always show the
 //! default layout.
 
@@ -16,13 +16,7 @@ fn path() -> PathBuf {
     if let Some(path) = std::env::var_os("ISOCAST_UI_PREFS") {
         return PathBuf::from(path);
     }
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let folder = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/Isocast")
-    } else {
-        home.join(".isocast")
-    };
-    folder.join("isocast-ui.json")
+    isocast_protocol::api::config_folder().join("isocast-ui.json")
 }
 
 /// Put the saved layout on the window (anything missing keeps its default).

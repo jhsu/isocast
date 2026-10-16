@@ -8,7 +8,7 @@
 //! ← {"jsonrpc":"2.0","id":1,"result":{"state":"idle",...}}
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1485,7 +1485,7 @@ pub fn is_engine_executable(name: &std::ffi::OsStr) -> bool {
 
 /// Where the daemon listens: `$ISOCAST_SOCKET`, or else
 /// `~/Library/Application Support/Isocast/isocastd.sock` on macOS and
-/// `~/.isocast/isocastd.sock` elsewhere.
+/// `$XDG_RUNTIME_DIR/isocast/isocastd.sock` elsewhere.
 pub fn socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("ISOCAST_SOCKET") {
         return PathBuf::from(path);
@@ -1495,7 +1495,7 @@ pub fn socket_path() -> PathBuf {
 
 /// The user's own engine's socket, whatever `$ISOCAST_SOCKET` says.
 pub fn default_socket_path() -> PathBuf {
-    support_folder().join("isocastd.sock")
+    runtime_folder().join("isocastd.sock")
 }
 
 /// The file a running daemon holds locked (and writes its pid in), next to
@@ -1508,8 +1508,8 @@ pub fn lock_path() -> PathBuf {
 /// Where the daemon keeps the live setup between runs: `$ISOCAST_SETUP`;
 /// else, for a daemon on a socket of its own (`$ISOCAST_SOCKET`), a file
 /// named after the socket beside it (`/tmp/x.sock` → `/tmp/x.setup.toml`),
-/// so test daemons never touch the real one; else `setup.toml` beside the
-/// default socket. Its scene collections and profiles are kept in a folder
+/// so test daemons never touch the real one; else `setup.toml` in the
+/// config folder. Its scene collections and profiles are kept in a folder
 /// named after this file (`setup.toml` → `setup/`); the file itself is the
 /// whole setup as earlier versions kept it, taken in from there.
 pub fn setup_path() -> PathBuf {
@@ -1524,14 +1524,13 @@ pub fn setup_path() -> PathBuf {
             .unwrap_or_else(|| "isocastd".into());
         return socket.with_file_name(format!("{stem}.setup.toml"));
     }
-    support_folder().join("setup.toml")
+    config_folder().join("setup.toml")
 }
 
 /// Where the daemon keeps installed plugins: `$ISOCAST_PLUGINS`; else, for
 /// a daemon on a socket of its own (`$ISOCAST_SOCKET`), a folder named
 /// after the socket beside it (`/tmp/x.sock` → `/tmp/x.plugins`), so test
-/// daemons never touch the real one; else `plugins` beside the default
-/// socket.
+/// daemons never touch the real one; else `plugins` in the data folder.
 pub fn plugins_path() -> PathBuf {
     if let Some(path) = std::env::var_os("ISOCAST_PLUGINS") {
         return PathBuf::from(path);
@@ -1544,14 +1543,14 @@ pub fn plugins_path() -> PathBuf {
             .unwrap_or_else(|| "isocastd".into());
         return socket.with_file_name(format!("{stem}.plugins"));
     }
-    support_folder().join("plugins")
+    data_folder().join("plugins")
 }
 
 /// Where the daemon keeps timelines (one `<id>.timeline.json` each, and
 /// `current.json`): `$ISOCAST_TIMELINES`; else, for a daemon on a socket
 /// of its own (`$ISOCAST_SOCKET`), a folder named after the socket beside
 /// it (`/tmp/x.sock` → `/tmp/x.timelines`), so test daemons never touch
-/// the real ones; else `timelines` beside the default socket.
+/// the real ones; else `timelines` in the data folder.
 pub fn timelines_path() -> PathBuf {
     if let Some(path) = std::env::var_os("ISOCAST_TIMELINES") {
         return PathBuf::from(path);
@@ -1564,16 +1563,128 @@ pub fn timelines_path() -> PathBuf {
             .unwrap_or_else(|| "isocastd".into());
         return socket.with_file_name(format!("{stem}.timelines"));
     }
-    support_folder().join("timelines")
+    data_folder().join("timelines")
 }
 
-/// `~/Library/Application Support/Isocast` on macOS, `~/.isocast` elsewhere.
-fn support_folder() -> PathBuf {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+/// What users edit and keep (scene collections, profiles, the app's
+/// layout): `~/Library/Application Support/Isocast` on macOS,
+/// `$XDG_CONFIG_HOME/isocast` (`~/.config/isocast`) elsewhere.
+pub fn config_folder() -> PathBuf {
+    xdg_folder("XDG_CONFIG_HOME", ".config")
+}
+
+/// What Isocast keeps for the user that isn't config (plugins, timelines):
+/// the support folder on macOS, `$XDG_DATA_HOME/isocast`
+/// (`~/.local/share/isocast`) elsewhere.
+pub fn data_folder() -> PathBuf {
+    xdg_folder("XDG_DATA_HOME", ".local/share")
+}
+
+/// What should outlive a restart but isn't worth backing up (logs, the
+/// portal's restore tokens): the support folder on macOS,
+/// `$XDG_STATE_HOME/isocast` (`~/.local/state/isocast`) elsewhere.
+pub fn state_folder() -> PathBuf {
+    xdg_folder("XDG_STATE_HOME", ".local/state")
+}
+
+/// The socket and its lock: the support folder on macOS,
+/// `$XDG_RUNTIME_DIR/isocast` elsewhere (private to the user and emptied
+/// at logout), else the state folder when there's no runtime folder.
+pub fn runtime_folder() -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/Isocast")
-    } else {
-        home.join(".isocast")
+        return support_folder();
+    }
+    match absolute_var("XDG_RUNTIME_DIR") {
+        Some(folder) => folder.join("isocast"),
+        None => state_folder(),
+    }
+}
+
+/// `~/Library/Application Support/Isocast` on macOS; elsewhere, `isocast`
+/// in the XDG folder `var` names, or in `~/default` when it's unset or
+/// relative (as the XDG spec says to treat it).
+fn xdg_folder(var: &str, default: &str) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return support_folder();
+    }
+    absolute_var(var)
+        .unwrap_or_else(|| home().join(default))
+        .join("isocast")
+}
+
+fn absolute_var(var: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(var)?);
+    path.is_absolute().then_some(path)
+}
+
+fn home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+}
+
+/// `~/Library/Application Support/Isocast`.
+fn support_folder() -> PathBuf {
+    home().join("Library/Application Support/Isocast")
+}
+
+/// Move what an earlier Isocast kept in `~/.isocast` into the XDG folders,
+/// once, for the user's own engine (not one on `$ISOCAST_SOCKET` or
+/// `$ISOCAST_SETUP`). A folder already at its new place (`logs`, which
+/// the CLI starts before launching the daemon) takes in what it lacks;
+/// a file already there wins. The old socket, lock and log are left for
+/// a daemon that may still be running there. Returns what happened, for
+/// the log.
+pub fn adopt_legacy_folder() -> Vec<String> {
+    let legacy = home().join(".isocast");
+    if cfg!(target_os = "macos")
+        || std::env::var_os("ISOCAST_SOCKET").is_some()
+        || std::env::var_os("ISOCAST_SETUP").is_some()
+    {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&legacy) else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let folder = match name.to_str() {
+            Some("isocastd.sock" | "isocastd.lock" | "isocastd.log") => continue,
+            Some("logs" | "linux-screencast.json") => state_folder(),
+            Some("plugins" | "timelines") => data_folder(),
+            _ => config_folder(),
+        };
+        adopt(&entry.path(), &folder.join(&name), true, &mut notes);
+    }
+    notes
+}
+
+/// Move `from` to `to`, or, when both are folders, what `to` lacks. Notes
+/// what happened at the top level and every failure.
+fn adopt(from: &Path, to: &Path, top: bool, notes: &mut Vec<String>) {
+    let moved = match to.symlink_metadata() {
+        Err(_) => to
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::rename(from, to)),
+        Ok(meta) if meta.is_dir() && from.is_dir() => {
+            for entry in std::fs::read_dir(from).into_iter().flatten().flatten() {
+                adopt(&entry.path(), &to.join(entry.file_name()), false, notes);
+            }
+            let _ = std::fs::remove_dir(from);
+            if top {
+                notes.push(format!("merged {} into {}", from.display(), to.display()));
+            }
+            return;
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "already there",
+        )),
+    };
+    match moved {
+        Ok(()) if top => notes.push(format!("moved {} to {}", from.display(), to.display())),
+        Ok(()) => {}
+        Err(err) => notes.push(format!("left {} ({}: {err})", from.display(), to.display())),
     }
 }
 
