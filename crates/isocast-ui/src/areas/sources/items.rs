@@ -8,12 +8,15 @@
 
 use std::rc::Rc;
 
-use isocast_protocol::api::{Method, SnapshotParams};
+use isocast_protocol::api::{
+    CapacityEstimate, CapacityParams, IsoAdmission, Method, SnapshotParams,
+};
 use isocast_protocol::{SceneItem, Setup};
 use serde_json::{Map, Value, json};
 
 use crate::ToastKind;
 use crate::app::App;
+use crate::kit::MenuBuilder;
 use crate::model;
 use crate::session::EditOptions;
 use crate::toasts::Toast;
@@ -156,6 +159,12 @@ fn without_source(setup: &Value, id: &str) -> Value {
         }
         if iso.get("audio").is_some() {
             iso["audio"] = drop(&iso["audio"]);
+        }
+        if let Some(lists) = iso.get_mut("source_audio").and_then(Value::as_object_mut) {
+            lists.remove(id);
+            for list in lists.values_mut() {
+                *list = drop(list);
+            }
         }
     }
     out
@@ -434,8 +443,79 @@ pub fn is_iso(setup: &Setup, id: &str) -> bool {
 }
 
 /// Record source `id` to its own file, or stop (turning ISO recording on
-/// if it was off).
+/// if it was off). Turning one on asks the engine how it fits this Mac's
+/// encoders first: at a smaller size or rate, or not at all, and says why
+/// (#66). If it can't say, the file goes on as asked.
 pub fn set_iso(app: &Rc<App>, id: &str, on: bool) {
+    if on {
+        let id = id.to_string();
+        app.call_as(
+            Method::EstimateCapacity(Box::new(CapacityParams {
+                setup: None,
+                stream: None,
+                add_iso: Some(id.clone()),
+            })),
+            move |app, result: Result<CapacityEstimate, _>| match result
+                .ok()
+                .and_then(|e| e.admission)
+            {
+                Some(admission) => admit_iso(app, &id, admission),
+                None => set_iso_now(app, &id, true),
+            },
+        );
+        return;
+    }
+    set_iso_now(app, id, on);
+}
+
+/// Turn the ISO file on as the engine said it fits.
+fn admit_iso(app: &Rc<App>, id: &str, admission: IsoAdmission) {
+    let name = {
+        let s = app.session.borrow();
+        s.setup
+            .as_ref()
+            .and_then(|setup| model::find_source(setup, id))
+            .map(|source| model::source_name(source).to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let reason = admission
+        .reason
+        .as_deref()
+        .map(crate::app::sentence)
+        .unwrap_or_default();
+    match (admission.on, admission.change) {
+        (true, Some(change)) => {
+            let as_is = admission.as_is;
+            let format = match (admission.width, admission.height, admission.fps) {
+                (Some(w), Some(h), Some(fps)) => format!("at {w}×{h}, {fps} fps"),
+                _ => "smaller".into(),
+            };
+            app.edit_then(change, EditOptions::default(), move |app, applied| {
+                if applied && !as_is {
+                    app.toast(
+                        ToastKind::Warning,
+                        &format!("“{name}” captures smaller to fit"),
+                        format!(
+                            "It now captures {format}, in its ISO file and wherever scenes \
+                             show it. {reason}."
+                        ),
+                    );
+                }
+            });
+        }
+        (true, None) => {}
+        (false, _) => {
+            app.toast(
+                ToastKind::Warning,
+                &format!("“{name}” isn’t recorded to its own file"),
+                format!("{reason}. Turn off another ISO file, or lower the program’s size, first."),
+            );
+        }
+    }
+}
+
+fn set_iso_now(app: &Rc<App>, id: &str, on: bool) {
     let patch = {
         let s = app.session.borrow();
         let Some(setup) = s.setup.clone() else { return };
@@ -447,6 +527,76 @@ pub fn set_iso(app: &Rc<App>, id: &str, on: bool) {
         let mut patch = json!({ "recording": { "iso": { "sources": sources } } });
         if on && !iso.enabled {
             patch["recording"]["iso"]["enabled"] = json!(true);
+        }
+        patch
+    };
+    app.edit(patch, EditOptions::default());
+}
+
+/// The "ISO Audio" menu of video source `id`'s ISO file: "Same as Other
+/// ISO Files" (the shared choice) and each audio source, checked when the
+/// file records it. Ids are `iso_audio:default` and `iso_audio:<audio id>`.
+pub fn iso_audio_menu(mut menu: MenuBuilder, setup: &Setup, id: &str) -> MenuBuilder {
+    let iso = &setup.recording.iso;
+    let Some(source) = setup.source(id) else {
+        return menu;
+    };
+    let tracks = iso.audio_for(source, source.kind.has_audio());
+    menu = menu
+        .item("iso_audio:default", "Same as Other ISO Files")
+        .checked(!iso.source_audio.contains_key(id))
+        .separator();
+    for audio in setup.sources.iter().filter(|s| s.kind.has_audio()) {
+        menu = menu
+            .item(
+                &format!("iso_audio:{}", audio.id),
+                model::source_name(audio),
+            )
+            .checked(tracks.contains(&audio.id));
+    }
+    menu
+}
+
+/// The `source_audio` entry an `iso_audio:` item of [`iso_audio_menu`]
+/// for source `id` makes: null (back to the shared choice) for `default`,
+/// else the file's tracks with `audio` added or taken out, starting from
+/// what it records now.
+pub fn toggled_iso_audio(setup: &Setup, id: &str, audio: &str) -> Value {
+    let Some(source) = setup.source(id) else {
+        return Value::Null;
+    };
+    if audio == "default" {
+        return Value::Null;
+    }
+    let mut tracks = setup
+        .recording
+        .iso
+        .audio_for(source, source.kind.has_audio());
+    match tracks.iter().position(|t| t == audio) {
+        Some(at) => {
+            tracks.remove(at);
+        }
+        None => tracks.push(audio.to_string()),
+    }
+    json!(tracks)
+}
+
+/// Act on an `iso_audio:` item of [`iso_audio_menu`] for source `id`.
+pub fn choose_iso_audio(app: &Rc<App>, id: &str, audio: &str) {
+    let patch = {
+        let s = app.session.borrow();
+        let Some(setup) = s.setup.as_ref() else {
+            return;
+        };
+        let Some(source) = setup.source(id) else {
+            return;
+        };
+        let list = toggled_iso_audio(setup, id, audio);
+        let mut patch = json!({ "recording": { "iso": { "source_audio": { id: list } } } });
+        // The list says whether the file has the source's own sound; an
+        // audio.iso opt-in or opt-out would override it.
+        if audio == id && source.audio.iso.is_some() {
+            patch["sources"] = json!([{ "id": id, "audio": { "iso": null } }]);
         }
         patch
     };

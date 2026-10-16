@@ -23,13 +23,16 @@ pub mod library;
 pub mod located;
 pub mod manifest;
 pub mod obs;
+pub mod optimize;
 pub mod plugin;
 pub mod project;
+pub mod replay;
 mod source;
 pub mod stream;
 pub mod timeline;
 mod transition;
 pub mod virtual_camera;
+pub mod websocket;
 
 pub use animation::*;
 pub use audio_filter::*;
@@ -40,7 +43,7 @@ pub use layout::Layout;
 pub use source::*;
 pub use transition::*;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -811,6 +814,9 @@ pub struct Recording {
     /// its files, at least 64 MB, if that is more).
     #[serde(default = "default_keep_free_gb")]
     pub keep_free_gb: f64,
+    /// The replay buffer: how much of the program it keeps.
+    #[serde(default, skip_serializing_if = "replay::ReplaySettings::is_default")]
+    pub replay: replay::ReplaySettings,
 }
 
 fn default_keep_free_gb() -> f64 {
@@ -920,11 +926,18 @@ pub struct IsoRecording {
     pub filename: String,
     #[serde(default)]
     pub encoder: Encoder,
-    /// Audio sources written into every ISO file. Omitted: each ISO uses
-    /// its own source's sound. An explicit list (including []) preserves
-    /// the chosen shared routing. A source's audio.iso can override its own sound.
+    /// Audio sources written into every ISO file without a list of its
+    /// own in `source_audio`. Omitted: each ISO uses its own source's
+    /// sound. An explicit list (including []) preserves the chosen shared
+    /// routing. A source's audio.iso can override its own sound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<Vec<String>>,
+    /// Audio sources for one ISO file, by its video source's id, instead
+    /// of `audio`: `{ camera = ["mic"], screen = ["desktop"] }`. An empty
+    /// list records that file without audio. Sources not listed follow
+    /// `audio`; a source's audio.iso still adds or drops its own sound.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_audio: BTreeMap<String, Vec<String>>,
     /// Record sources with filters as filtered (as the program shows them)
     /// rather than as captured, and audio with its audio filters (all but
     /// sidechain ducking). Keyed-out areas come out black, since the files
@@ -941,6 +954,7 @@ impl Default for IsoRecording {
             filename: default_iso_filename(),
             encoder: Encoder::default(),
             audio: None,
+            source_audio: BTreeMap::new(),
             filtered: false,
         }
     }
@@ -950,8 +964,9 @@ impl IsoRecording {
     /// Effective tracks for one file. `has_audio` comes from the opened
     /// source, since a media file or browser can have no audio stream.
     pub fn audio_for(&self, source: &Source, has_audio: bool) -> Vec<String> {
-        let mut audio = self.audio.clone().unwrap_or_default();
-        let own = source.audio.iso.unwrap_or(self.audio.is_none());
+        let listed = self.source_audio.get(&source.id).or(self.audio.as_ref());
+        let mut audio = listed.cloned().unwrap_or_default();
+        let own = source.audio.iso.unwrap_or(listed.is_none());
         if !own && source.audio.iso == Some(false) {
             audio.retain(|id| id != &source.id);
         }
@@ -959,6 +974,31 @@ impl IsoRecording {
             audio.push(source.id.clone());
         }
         audio
+    }
+
+    /// The audio sources the ISO files list (`audio`, and `source_audio`
+    /// for the ISO sources), with repeats; a file's own sound isn't listed.
+    pub fn listed_audio(&self) -> impl Iterator<Item = &String> {
+        self.audio.iter().flatten().chain(
+            self.sources
+                .iter()
+                .filter_map(|id| self.source_audio.get(id))
+                .flatten(),
+        )
+    }
+
+    /// The setup field listing audio source `id` for the ISO files, for
+    /// messages: `recording.iso.audio` or `recording.iso.source_audio.<iso>`.
+    pub fn audio_field(&self, id: &str) -> Option<String> {
+        if self.audio.iter().flatten().any(|a| a == id) {
+            return Some("recording.iso.audio".into());
+        }
+        self.sources.iter().find_map(|iso| {
+            self.source_audio
+                .get(iso)
+                .is_some_and(|list| list.iter().any(|a| a == id))
+                .then(|| format!("recording.iso.source_audio.{iso}"))
+        })
     }
 }
 
@@ -1356,7 +1396,19 @@ impl Setup {
                 ("mic", arg) => SourceKind::Microphone(MicrophoneSource {
                     device: arg.unwrap_or("default").to_string(),
                 }),
-                ("system-audio", None) => SourceKind::SystemAudio(SystemAudioSource {}),
+                ("system-audio", None) => SourceKind::SystemAudio(SystemAudioSource::default()),
+                ("system-audio", Some(arg)) => match arg.strip_prefix("except=") {
+                    Some(apps) if !apps.trim().is_empty() => {
+                        SourceKind::SystemAudio(SystemAudioSource {
+                            exclude: apps.split(',').map(|a| a.trim().to_string()).collect(),
+                        })
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{spec:?}: expected system-audio or system-audio:except=APP[,APP]"
+                        ));
+                    }
+                },
                 ("camera", Some(device)) => SourceKind::Camera(CameraSource {
                     device: device.to_string(),
                     width: None,
@@ -1438,6 +1490,7 @@ impl Setup {
                     ..IsoRecording::default()
                 },
                 keep_free_gb: default_keep_free_gb(),
+                replay: Default::default(),
             },
             stream: None,
             hotkeys: Default::default(),
@@ -1672,6 +1725,17 @@ impl Setup {
         for (i, id) in rec.iso.audio.iter().flatten().enumerate() {
             issues.check_ref(format!("recording.iso.audio[{i}]"), id, &audio, "audio");
         }
+        for (iso, ids) in &rec.iso.source_audio {
+            let path = format!("recording.iso.source_audio.{iso}");
+            issues.check_ref(path.clone(), iso, &video, "video");
+            let mut seen = HashSet::new();
+            for (i, id) in ids.iter().enumerate() {
+                if !seen.insert(id) {
+                    issues.add(format!("{path}[{i}]"), format!("{id:?} is listed twice"));
+                }
+                issues.check_ref(format!("{path}[{i}]"), id, &audio, "audio");
+            }
+        }
         if rec.iso.enabled
             && rec.iso.sources.len() > 1
             && !rec.iso.filename.contains("{source}")
@@ -1723,6 +1787,7 @@ impl Setup {
                 "give width and height together, or neither to record the canvas's size",
             ),
         }
+        rec.replay.check(&mut issues);
         if !(rec.keep_free_gb >= 0.0 && rec.keep_free_gb <= 1e6) {
             issues.add(
                 "recording.keep_free_gb",
@@ -2074,7 +2139,7 @@ pub const QUICK_SOURCES: &[&str] = &[
     "display[:NAME_OR_ID]",
     "camera:NAME_OR_ID",
     "mic[:NAME_OR_ID]",
-    "system-audio",
+    "system-audio[:except=APP[,APP]]",
     "window:APP",
     "app-audio:APP",
     "test-pattern[:WIDTHxHEIGHT[@FPS]]",

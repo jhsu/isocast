@@ -66,6 +66,8 @@ pub struct App {
     pub library: areas::library::Library,
     pub create: areas::create::Create,
     pub developer: areas::developer::Developer,
+    pub permissions: areas::permissions::PermissionsStep,
+    pub wizard: areas::wizard::Wizard,
     /// `--drag-test`: how long each flush (the areas showing a change) and
     /// each update from the daemon took on the window's thread.
     pub work_log: RefCell<Option<WorkLog>>,
@@ -105,6 +107,8 @@ impl App {
             library: areas::library::Library::default(),
             create: areas::create::Create::default(),
             developer: areas::developer::Developer::default(),
+            permissions: areas::permissions::PermissionsStep::default(),
+            wizard: areas::wizard::Wizard::default(),
         });
         window.set_version(env!("CARGO_PKG_VERSION").into());
         if !mode.offscreen {
@@ -139,9 +143,15 @@ impl App {
         app
     }
 
+    /// Calls made to the daemon and not answered yet (the motion
+    /// harness's lockstep waits for none).
+    pub fn calls_pending(&self) -> usize {
+        self.replies.borrow().len()
+    }
+
     /// The areas, in the order they update. Create comes first so that in
     /// its view Delete takes off the selected clip, not a scene item.
-    pub fn areas(&self) -> [&dyn Area; 8] {
+    pub fn areas(&self) -> [&dyn Area; 10] {
         [
             &self.create,
             &self.canvas,
@@ -151,6 +161,8 @@ impl App {
             &self.settings,
             &self.library,
             &self.developer,
+            &self.permissions,
+            &self.wizard,
         ]
     }
 
@@ -318,7 +330,7 @@ impl App {
         self.refresh_status(false);
     }
 
-    fn event(self: &Rc<Self>, event: Event) {
+    pub(crate) fn event(self: &Rc<Self>, event: Event) {
         match &event {
             Event::SetupChanged { revision } => {
                 let stale = {
@@ -381,6 +393,17 @@ impl App {
                 self.session.borrow_mut().vcam = Some(camera.clone());
                 self.changed(Changed::VCAM);
             }
+            Event::Replay { replay } => {
+                self.session.borrow_mut().replay = Some(replay.clone());
+                self.changed(Changed::REPLAY);
+            }
+            // The window that asked says so itself; a hotkey's or another
+            // client's save gets the same toast here.
+            Event::ReplaySaved { saved } => {
+                if !self.session.borrow().saving_replay {
+                    crate::areas::controls::replay_saved(self, saved);
+                }
+            }
             Event::Started { .. } => self.refresh_status(true),
             // Plugin-facing context; the app refreshes on `started` and
             // `stopped`.
@@ -420,14 +443,32 @@ impl App {
                 self.changed(Changed::RUNNING);
             }
             Event::Stream { stream } => {
-                let before = self.session.borrow().stream.as_ref().map(|s| s.state);
-                self.session.borrow_mut().stream = Some(stream.clone());
+                let (before, several) = {
+                    let s = self.session.borrow();
+                    let before = s
+                        .streams
+                        .iter()
+                        .find(|x| x.id == stream.id)
+                        .map(|x| x.state);
+                    (before, s.streams.len() > 1)
+                };
+                self.session.borrow_mut().set_stream(stream.clone());
+                // Each destination says so itself when there are several.
+                let what = if several {
+                    format!("the stream to {}", stream.id)
+                } else {
+                    "the stream".to_string()
+                };
                 if stream.state == StreamState::Failed && before != Some(StreamState::Failed) {
                     let why = stream
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "It couldn’t stay connected.".into());
-                    self.toast(ToastKind::Error, "The stream stopped", why);
+                    self.toast(
+                        ToastKind::Error,
+                        &format!("{} stopped", capital(&what)),
+                        why,
+                    );
                 } else if stream.state == StreamState::Reconnecting
                     && before == Some(StreamState::Live)
                 {
@@ -435,7 +476,7 @@ impl App {
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "The connection dropped.".into());
-                    self.toast(ToastKind::Warning, "Reconnecting the stream", why);
+                    self.toast(ToastKind::Warning, &format!("Reconnecting {what}"), why);
                 }
                 self.changed(Changed::STREAM);
             }
@@ -469,6 +510,8 @@ impl App {
                 }
             }
             Event::Marker { .. } => {}
+            // The Controls area shows its notice.
+            Event::EncoderOverload { .. } => {}
         }
         for area in self.areas() {
             area.event(self, &event);
@@ -800,7 +843,7 @@ impl App {
                     return;
                 }
                 let interval = next.interval;
-                let since = s.last_sent.map_or(Duration::MAX, |t| t.elapsed());
+                let since = s.last_sent.map_or(Duration::MAX, crate::clock::since);
                 if since < interval {
                     s.waiting = true;
                     let weak = Rc::downgrade(self);
@@ -841,7 +884,7 @@ impl App {
                 s.inflight.push_back((edit, revision));
                 s.applies_sent += 1;
                 s.most_in_flight = s.most_in_flight.max(s.inflight.len());
-                s.last_sent = Some(Instant::now());
+                s.last_sent = Some(crate::clock::now());
                 ApplyParams {
                     revision,
                     change,
@@ -1004,7 +1047,7 @@ impl App {
 
     /// Read the engine's status (`quiet`: no toast if it fails).
     pub fn refresh_status(self: &Rc<Self>, quiet: bool) {
-        let asked = Instant::now();
+        let asked = crate::clock::now();
         self.call_as::<Status>(Method::Status, move |app, result| match result {
             Ok(status) => {
                 {
@@ -1030,10 +1073,13 @@ impl App {
                         s.studio = status.preview.is_some();
                     }
                     if !s.busy_stream {
-                        s.stream = status.stream.clone();
+                        s.set_streams(status.stream.clone(), status.streams.clone());
                     }
                     if !s.busy_vcam {
                         s.vcam = status.virtual_camera.clone();
+                    }
+                    if !s.busy_replay {
+                        s.replay = status.replay.clone();
                     }
                     s.status = Some(status);
                 }
@@ -1042,13 +1088,19 @@ impl App {
                         | Changed::SCENES
                         | Changed::RUNNING
                         | Changed::STREAM
-                        | Changed::VCAM,
+                        | Changed::VCAM
+                        | Changed::REPLAY,
                 );
             }
             Err(error) => {
                 let connected = app.session.borrow().link == Some(Link::Connected);
-                // Not while an update stops the engine on purpose.
-                if !quiet && connected && !crate::update::stopping_engine() {
+                // Not while an update, or the permissions step's Relaunch,
+                // stops the engine on purpose.
+                if !quiet
+                    && connected
+                    && !crate::update::stopping_engine()
+                    && !app.permissions.relaunching()
+                {
                     app.failed("Couldn’t read the engine’s status", &error);
                 }
             }
@@ -1073,7 +1125,7 @@ impl App {
     pub fn choose_scene(self: &Rc<Self>, id: &str) {
         let studio = {
             let mut s = self.session.borrow_mut();
-            s.switched_at = Some(Instant::now());
+            s.switched_at = Some(crate::clock::now());
             s.selection = None;
             if s.studio {
                 s.preview = Some(id.to_string());
@@ -1115,7 +1167,7 @@ impl App {
             let Some(preview) = s.preview.clone() else {
                 return;
             };
-            s.switched_at = Some(Instant::now());
+            s.switched_at = Some(crate::clock::now());
             let on_air = s.scene.replace(preview);
             s.preview = on_air;
         }
@@ -1132,7 +1184,7 @@ impl App {
         let stage = {
             let mut s = self.session.borrow_mut();
             s.studio = on;
-            s.switched_at = Some(Instant::now());
+            s.switched_at = Some(crate::clock::now());
             if !on {
                 s.preview = None;
             }
@@ -1405,4 +1457,13 @@ pub fn sentence(text: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// `text` with its first letter capitalized ("the stream" → "The stream").
+fn capital(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }

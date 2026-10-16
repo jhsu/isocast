@@ -25,6 +25,7 @@
 //! - Which sources are recorded is the collection's (they must exist in
 //!   it); whether ISO files are written at all, and how, is the profile's.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use schemars::JsonSchema;
@@ -155,11 +156,14 @@ pub struct CollectionIso {
     /// Explicit shared ISO tracks; omitted uses each source's own sound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<Vec<String>>,
+    /// Tracks for one ISO file, by its source, instead of `audio`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_audio: BTreeMap<String, Vec<String>>,
 }
 
 impl CollectionIso {
     fn is_empty(&self) -> bool {
-        self.sources.is_empty() && self.audio.is_none()
+        self.sources.is_empty() && self.audio.is_none() && self.source_audio.is_empty()
     }
 }
 
@@ -208,6 +212,12 @@ pub struct ProfileRecording {
     /// Free space, in GB, a recording never uses.
     #[serde(default = "default_keep_free_gb")]
     pub keep_free_gb: f64,
+    /// The replay buffer: how much of the program it keeps.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::replay::ReplaySettings::is_default"
+    )]
+    pub replay: crate::replay::ReplaySettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -284,6 +294,7 @@ impl Setup {
                         CollectionIso {
                             sources: iso_sources,
                             audio: iso_audio,
+                            source_audio,
                         },
                 },
         } = collection;
@@ -311,6 +322,7 @@ impl Setup {
                             filtered,
                         },
                     keep_free_gb,
+                    replay,
                 },
             stream,
             hotkeys,
@@ -342,9 +354,11 @@ impl Setup {
                     filename: iso_filename,
                     encoder: iso_encoder,
                     audio: iso_audio,
+                    source_audio,
                     filtered,
                 },
                 keep_free_gb,
+                replay,
             },
             stream,
             hotkeys,
@@ -385,9 +399,11 @@ impl Setup {
                             filename: iso_filename,
                             encoder: iso_encoder,
                             audio: iso_audio,
+                            source_audio,
                             filtered,
                         },
                     keep_free_gb,
+                    replay,
                 },
             stream,
             hotkeys,
@@ -409,6 +425,7 @@ impl Setup {
                 iso: CollectionIso {
                     sources: iso_sources,
                     audio: iso_audio,
+                    source_audio,
                 },
             },
         };
@@ -433,6 +450,7 @@ impl Setup {
                     filtered,
                 },
                 keep_free_gb,
+                replay,
             },
             stream,
             hotkeys,
@@ -451,6 +469,7 @@ const PROFILE_FIELDS: &[&str] = &[
     "stream",
     "recording.folder",
     "recording.keep_free_gb",
+    "recording.replay",
     "recording.program.enabled",
     "recording.program.filename",
     "recording.program.encoder",
@@ -528,6 +547,7 @@ impl Profile {
                     ..ProfileIso::default()
                 },
                 keep_free_gb: default_keep_free_gb(),
+                replay: Default::default(),
             },
             stream: None,
             hotkeys: Default::default(),
@@ -730,6 +750,11 @@ pub struct LibraryImportObsParams {
     /// streaming).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub switch: bool,
+    /// Move the stream key OBS keeps in plain text in the profile's
+    /// service.json into the Keychain, for the imported profile's service
+    /// (only when the user agreed to it). Without it the key stays behind.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_key: bool,
 }
 
 /// A scene collection or profile as a document, for export or to read one

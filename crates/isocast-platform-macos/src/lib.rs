@@ -22,6 +22,7 @@ mod audio;
 mod browser;
 mod camera;
 mod capture;
+mod crash_safe;
 mod devices;
 pub mod diagnostics;
 mod frames;
@@ -30,15 +31,20 @@ pub mod hotkeys;
 mod join;
 mod jpeg;
 mod keychain;
+mod matroska;
 mod media;
 mod output;
 mod pacing;
 mod permissions;
 pub mod plugin;
+mod recode;
 mod stream;
 mod system;
+mod tap;
 mod termination;
 pub mod virtual_camera;
+mod vp8;
+mod webm;
 mod writer;
 
 use isocast_engine::{
@@ -61,8 +67,100 @@ pub use camera::CameraCapture;
 pub use capture::DisplayCapture;
 pub use frames::{FramePool, PixelBuffer};
 pub use gpu::MetalImporter;
+pub use keychain::app_identifier;
 pub use stream::{AacEncoder, H264Encoder};
 pub use writer::AssetWriter;
+
+/// A recording file: AVAssetWriter's, or the crash-safe prototype's
+/// (`ISOCAST_CRASH_SAFE=1`; see `crash_safe`).
+// One writer per file, made once per take: its size doesn't matter, and
+// the AVAssetWriter path must stay exactly as it is (no box to go through).
+#[allow(clippy::large_enum_variant)]
+pub enum MacWriter {
+    Asset(AssetWriter),
+    CrashSafe(crash_safe::CrashSafeWriter),
+}
+
+impl isocast_engine::FileWriter for MacWriter {
+    type Frame = PixelBuffer;
+
+    fn prioritize_video(&mut self) {
+        match self {
+            Self::Asset(w) => w.prioritize_video(),
+            Self::CrashSafe(w) => w.prioritize_video(),
+        }
+    }
+
+    fn start(&mut self, at: Time) -> anyhow::Result<()> {
+        match self {
+            Self::Asset(w) => w.start(at),
+            Self::CrashSafe(w) => w.start(at),
+        }
+    }
+
+    fn append_video(&mut self, frame: &PixelBuffer, pts: Time) -> anyhow::Result<bool> {
+        match self {
+            Self::Asset(w) => w.append_video(frame, pts),
+            Self::CrashSafe(w) => w.append_video(frame, pts),
+        }
+    }
+
+    fn append_audio(&mut self, track: usize, samples: &[f32], pts: Time) -> anyhow::Result<bool> {
+        match self {
+            Self::Asset(w) => w.append_audio(track, samples, pts),
+            Self::CrashSafe(w) => w.append_audio(track, samples, pts),
+        }
+    }
+
+    fn queue_depth(&self) -> usize {
+        match self {
+            Self::Asset(w) => w.queue_depth(),
+            Self::CrashSafe(w) => w.queue_depth(),
+        }
+    }
+
+    fn finish(self, end: Time) -> anyhow::Result<isocast_engine::Finished> {
+        match self {
+            Self::Asset(w) => w.finish(end),
+            Self::CrashSafe(w) => w.finish(end),
+        }
+    }
+
+    fn cancel(self) {
+        match self {
+            Self::Asset(w) => w.cancel(),
+            Self::CrashSafe(w) => w.cancel(),
+        }
+    }
+
+    fn crash_safe(&self) -> bool {
+        match self {
+            Self::Asset(w) => w.crash_safe(),
+            Self::CrashSafe(w) => w.crash_safe(),
+        }
+    }
+
+    fn commit(&mut self) -> anyhow::Result<Option<std::time::Duration>> {
+        match self {
+            Self::Asset(w) => w.commit(),
+            Self::CrashSafe(w) => w.commit(),
+        }
+    }
+
+    fn committed(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Asset(w) => w.committed(),
+            Self::CrashSafe(w) => w.committed(),
+        }
+    }
+
+    fn lost_frames(&mut self) -> u64 {
+        match self {
+            Self::Asset(w) => w.lost_frames(),
+            Self::CrashSafe(w) => w.lost_frames(),
+        }
+    }
+}
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
 
@@ -81,7 +179,7 @@ pub enum Capture {
 impl Platform for MacPlatform {
     type Frame = PixelBuffer;
     type FramePool = FramePool;
-    type Writer = AssetWriter;
+    type Writer = MacWriter;
     type Capture = Capture;
     type Importer = MetalImporter;
     type Media = media::MediaReader;
@@ -124,12 +222,15 @@ impl Platform for MacPlatform {
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
-        Ok(permissions::report(devices::permissions()?))
+        Ok(permissions::live_report(devices::permissions()?))
     }
 
-    fn request_permissions(&self) -> anyhow::Result<PermissionsReport> {
-        let permissions = devices::request_permissions(std::time::Duration::from_secs(60))?;
-        Ok(permissions::report(permissions))
+    fn request_permissions(
+        &self,
+        only: Option<PermissionKind>,
+    ) -> anyhow::Result<PermissionsReport> {
+        let permissions = devices::request_permissions(std::time::Duration::from_secs(60), only)?;
+        Ok(permissions::live_report(permissions))
     }
 
     fn open_permission_settings(&self, permission: PermissionKind) -> anyhow::Result<String> {
@@ -224,8 +325,19 @@ impl Platform for MacPlatform {
         jpeg::encode(frame, max_width, quality)
     }
 
-    fn create_writer(&self, spec: &WriterSpec) -> anyhow::Result<AssetWriter> {
-        AssetWriter::create(spec)
+    fn create_writer(&self, spec: &WriterSpec) -> anyhow::Result<MacWriter> {
+        if crash_safe::enabled() {
+            return crash_safe::CrashSafeWriter::create(spec).map(MacWriter::CrashSafe);
+        }
+        AssetWriter::create(spec).map(MacWriter::Asset)
+    }
+
+    fn recover_file(
+        &self,
+        folder: &Path,
+        name: &std::ffi::OsStr,
+    ) -> anyhow::Result<Option<isocast_engine::RecoveredFile>> {
+        crash_safe::recover_file(folder, name)
     }
 
     fn capture_screen(
@@ -258,10 +370,11 @@ impl Platform for MacPlatform {
 
     fn capture_system_audio(
         &self,
+        exclude: &[String],
         sink: AudioSink,
         exclude_own: bool,
     ) -> anyhow::Result<(Capture, u32)> {
-        let (capture, channels) = audio::capture_system_audio(sink, exclude_own)?;
+        let (capture, channels) = audio::capture_system_audio(exclude, sink, exclude_own)?;
         Ok((Capture::SystemAudio(capture), channels))
     }
 
@@ -352,6 +465,30 @@ pub fn volume(path: &Path) -> anyhow::Result<Volume> {
     })
 }
 
+/// Whether the file system holding `path` can give a file a second name
+/// (`_PC_LINK_MAX` above 1). One that can't (exFAT and FAT say 1) may
+/// report any link count, and there a count above one isn't a hard link.
+/// An unanswered call counts as able, so a link check stays strict.
+pub(crate) fn hard_links_possible(path: &Path) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // -1 is "no limit" (or an error): able, either way.
+    !matches!(
+        unsafe { libc::pathconf(path.as_ptr(), libc::_PC_LINK_MAX) },
+        0 | 1
+    )
+}
+
+/// [`hard_links_possible`] for the file system of an open file.
+pub(crate) fn hard_links_possible_fd(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    !matches!(
+        unsafe { libc::fpathconf(file.as_raw_fd(), libc::_PC_LINK_MAX) },
+        0 | 1
+    )
+}
+
 /// Write 4 KB at the start of `probe` and fsync it, timed. Plain fsync,
 /// not F_FULLFSYNC (what Rust's `sync_data` does here), which would flush
 /// the drive's whole cache and slow the recording it measures.
@@ -378,6 +515,19 @@ static MAIN_LOOP: OnceLock<()> = OnceLock::new();
 /// Declare that this process's main thread is about to run
 /// [`run_main_queue`], so main-thread work asked for before it starts waits
 /// for it instead of being skipped.
+/// `isocastd --preflight-permissions`: the permissions this new process
+/// has, as an exit status with a bit for each one not granted (0: all), for
+/// a running engine to learn that a grant made in System Settings waits for
+/// its restart. Never prompts.
+pub fn preflight_permissions() -> Option<u8> {
+    (std::env::args().nth(1).as_deref() == Some(permissions::PREFLIGHT_ARG)).then(|| {
+        devices::permissions()
+            .map(|p| permissions::preflight_status(&p))
+            // Unreadable: "unknown" to the parent (not a bit pattern).
+            .unwrap_or(u8::MAX)
+    })
+}
+
 pub fn will_run_main_queue() {
     let _ = MAIN_LOOP.set(());
 }

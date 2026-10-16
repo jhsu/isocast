@@ -310,6 +310,9 @@ impl Timelines {
             clips,
             removed: timeline.removed.clone(),
             notes,
+            revision: timeline.revision,
+            undo: timeline.undo.len(),
+            redo: timeline.redo.len(),
         })
     }
 
@@ -347,6 +350,9 @@ impl Timelines {
             removed: Vec::new(),
             recording: Vec::new(),
             next_clip: 1,
+            revision: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
         };
         self.write(&timeline)?;
         self.timelines.insert(id.clone(), timeline);
@@ -397,8 +403,14 @@ impl Timelines {
     /// A recording project's folder moved from `from` to `to`: every
     /// timeline naming takes inside it names them there. All or nothing:
     /// if one can't be written, those already written are put back.
-    /// Returns the timelines changed.
-    pub fn move_folder(&mut self, from: &Path, to: &Path) -> Result<Vec<String>, RpcError> {
+    /// Clips moved without a project id get `project` (#56). Returns the
+    /// timelines changed.
+    pub fn move_folder(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        project: Option<&str>,
+    ) -> Result<Vec<String>, RpcError> {
         let fix = |path: &mut PathBuf| match isocast_protocol::project::moved(path, from, to) {
             Some(new) => {
                 *path = new;
@@ -411,7 +423,12 @@ impl Timelines {
             let mut moved = timeline.clone();
             let mut any = false;
             for clip in &mut moved.clips {
-                any |= fix(&mut clip.take);
+                if fix(&mut clip.take) {
+                    any = true;
+                    if clip.project.is_none() {
+                        clip.project = project.map(str::to_string);
+                    }
+                }
             }
             for removed in &mut moved.removed {
                 any |= fix(&mut removed.take);
@@ -493,7 +510,9 @@ pub fn append(timeline: &mut Timeline, take: &Path, manifest: &SessionManifest) 
             .parent()
             .and_then(isocast_protocol::project::read)
             .map(|file| file.id),
+        angle: None,
     });
+    crate::edit::recorded(timeline);
     id
 }
 
@@ -577,6 +596,8 @@ fn clip_info(clip: &Clip, index: usize, start: f64) -> ClipInfo {
         dropped_frames: 0,
         files: Vec::new(),
         problem: None,
+        angle: clip.angle.clone(),
+        fps: 0,
     };
     match read_manifest(&clip.take) {
         Ok(manifest) => {
@@ -584,6 +605,7 @@ fn clip_info(clip: &Clip, index: usize, start: f64) -> ClipInfo {
             info.started_at = Some(manifest.started_at.clone());
             info.status = Some(manifest.status);
             info.problem = unfinished(&clip.id, &clip.take, &manifest);
+            info.fps = timeline::take_length(&manifest).map_or(0, |(_, fps)| fps);
             info.files = manifest
                 .files
                 .iter()
@@ -601,6 +623,7 @@ fn clip_info(clip: &Clip, index: usize, start: f64) -> ClipInfo {
                         frames: file.frames,
                         dropped_frames: file.dropped_frames.unwrap_or(0),
                         audio_dropouts: file.audio_dropouts.unwrap_or(0),
+                        start_offset_seconds: file.start_offset_seconds,
                     }
                 })
                 .collect();
@@ -748,7 +771,7 @@ impl Daemon {
         *self.timelines.lock().unwrap() = loaded;
     }
 
-    fn timeline_changed(&self, id: &str, action: TimelineAction, clip: Option<String>) {
+    pub(crate) fn timeline_changed(&self, id: &str, action: TimelineAction, clip: Option<String>) {
         let timelines = self.timelines.lock().unwrap();
         let clips = timelines.get(id).map_or(0, |t| t.clips.len());
         let current = timelines.current().map(str::to_string);
@@ -791,34 +814,42 @@ impl Daemon {
             .iter()
             .flat_map(|root| isocast_protocol::project::scan(root))
             .collect();
-        let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut moves: Vec<(PathBuf, PathBuf, String)> = Vec::new();
         for (take, project) in missing {
             let (Some(old), Some(name)) = (take.parent(), take.file_name()) else {
                 continue;
             };
-            if moves.iter().any(|(from, _)| from == old) {
+            if moves.iter().any(|(from, _, _)| from == old) {
                 continue;
             }
             let by_id = project.and_then(|id| projects.iter().find(|(_, file)| file.id == id));
             let found = match by_id {
-                Some((folder, _)) => Some(folder.clone()),
+                Some((folder, file)) => Some((folder.clone(), file.id.clone())),
                 None => {
                     let holding: Vec<_> = projects
                         .iter()
                         .filter(|(folder, _)| folder.join(name).is_file())
                         .collect();
                     match holding.as_slice() {
-                        [(folder, _)] => Some(folder.clone()),
+                        [(folder, file)] => Some((folder.clone(), file.id.clone())),
                         _ => None,
                     }
                 }
             };
-            if let Some(new) = found.filter(|new| new.join(name).is_file()) {
-                moves.push((old.to_path_buf(), new));
+            if let Some((new, id)) = found.filter(|(new, _)| new.join(name).is_file()) {
+                moves.push((old.to_path_buf(), new, id));
             }
         }
-        for (from, to) in moves {
-            if let Err(err) = self.timelines.lock().unwrap().move_folder(&from, &to) {
+        for (from, to, id) in moves {
+            let moved = self
+                .timelines
+                .lock()
+                .unwrap()
+                .move_folder(&from, &to, Some(&id));
+            for message in crate::projects::heal_exports(&to) {
+                self.publish(Event::Warning { message });
+            }
+            if let Err(err) = moved {
                 self.publish(Event::Warning {
                     message: format!(
                         "timelines name takes in {}, which moved to {}, but couldn't be \
@@ -832,7 +863,11 @@ impl Daemon {
         }
     }
 
-    fn timeline_info(&self, id: &str, notes: Vec<String>) -> Result<TimelineInfo, RpcError> {
+    pub(crate) fn timeline_info(
+        &self,
+        id: &str,
+        notes: Vec<String>,
+    ) -> Result<TimelineInfo, RpcError> {
         self.heal_timelines();
         self.timelines
             .lock()
@@ -905,7 +940,10 @@ impl Daemon {
             let id = timelines.resolve(params.timeline.as_deref())?;
             let removed = timelines.change(&id, |timeline| {
                 let at = find(timeline, &params.clip)?;
-                Ok(remove(timeline, at, RemovedReason::Removed))
+                crate::edit::revise(timeline, TimelineAction::Removed, |timeline| {
+                    Ok(remove(timeline, at, RemovedReason::Removed))
+                })
+                .map_err(invalid)
             })?;
             (id, removed)
         };
@@ -927,7 +965,10 @@ impl Daemon {
             let id = timelines.resolve(params.timeline.as_deref())?;
             timelines.change(&id, |timeline| {
                 let at = find(timeline, &params.clip)?;
-                move_clip(timeline, at, params.index)
+                crate::edit::revise(timeline, TimelineAction::Moved, |timeline| {
+                    move_clip(timeline, at, params.index).map_err(|err| err.message)
+                })
+                .map_err(invalid)
             })?;
             id
         };
@@ -1218,6 +1259,7 @@ impl Daemon {
                 return Ok(None);
             }
             let clip = timeline.clips.pop().expect("checked");
+            crate::edit::recorded(timeline);
             let removed = RemovedTake {
                 take: clip.take.clone(),
                 clip: Some(clip.id.clone()),

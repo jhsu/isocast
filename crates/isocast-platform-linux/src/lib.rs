@@ -130,12 +130,16 @@ fn permissions_report() -> PermissionsReport {
                 PermissionKind::ScreenRecording => "displays, windows and system audio",
                 PermissionKind::Camera => "cameras",
                 PermissionKind::Microphone => "microphones",
+                PermissionKind::SystemAudio => "system audio",
             }
             .into(),
             action: PermissionAction::None,
             settings_url: String::new(),
             next_step: None,
             restart_after_granting: false,
+            app: "isocastd".into(),
+            app_path: None,
+            denied_without_prompt: false,
         })
         .collect();
     PermissionsReport {
@@ -143,6 +147,7 @@ fn permissions_report() -> PermissionsReport {
             screen_recording: Permission::Granted,
             camera: Permission::Granted,
             microphone: Permission::Granted,
+            system_audio: Permission::Granted,
         },
         app: "isocastd".into(),
         details,
@@ -187,7 +192,10 @@ impl Platform for LinuxPlatform {
         Ok(permissions_report())
     }
 
-    fn request_permissions(&self) -> anyhow::Result<PermissionsReport> {
+    fn request_permissions(
+        &self,
+        _only: Option<PermissionKind>,
+    ) -> anyhow::Result<PermissionsReport> {
         Ok(permissions_report())
     }
 
@@ -341,9 +349,16 @@ impl Platform for LinuxPlatform {
 
     fn capture_system_audio(
         &self,
+        exclude: &[String],
         sink: AudioSink,
         _exclude_own: bool,
     ) -> anyhow::Result<(Capture, u32)> {
+        if !exclude.is_empty() {
+            bail!(
+                "system_audio.exclude isn't supported on Linux yet: remove {exclude:?} \
+                 to record everything the computer plays"
+            );
+        }
         let (capture, channels) = audio::capture_system_audio(sink)?;
         Ok((Capture::Audio(capture), channels))
     }

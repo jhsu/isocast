@@ -12,30 +12,27 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::time::Duration;
 
 use isocast_protocol::api::{
     ApplyParams, ImportObsParams, InitParams, Method, StreamKeyParams, StreamKeyTarget,
 };
 use isocast_protocol::change::{Change, merge_patch};
-use isocast_protocol::devices::{
-    CameraKind, Devices, Permission, PermissionAction, PermissionKind, PermissionsReport,
-};
+use isocast_protocol::devices::{CameraKind, Devices, Permission};
 use isocast_protocol::init::{InitOptions, Layout};
-use isocast_protocol::stream::{StreamService, StreamState};
+use isocast_protocol::stream::{MAIN_DESTINATION, StreamService, StreamState, StreamStatus};
 use isocast_protocol::{EncoderQuality, QualityPreset, Setup};
 use serde_json::{Map, Value, json};
 use slint::{ComponentHandle, SharedString};
 
 use super::{Area, Changed};
-use crate::app::{App, sentence};
+use crate::app::App;
 use crate::daemon::{Link, Update};
 use crate::kit::{self, model};
 use crate::platform::{self, Choose};
 use crate::session::EditOptions;
 use crate::{
-    AppWindow, DeviceChoice, DropdownOption, HotkeyGroup, HotkeyRow, IsoChoice, MicRow, NavTab,
-    PermissionRow, ServiceChoice, SettingsArea, ToastKind, Ui,
+    AppWindow, DestinationRow, DeviceChoice, DropdownOption, HotkeyGroup, HotkeyRow, IsoChoice,
+    IsoTrack, MicRow, NavTab, ServiceChoice, SettingsArea, ToastKind, Ui,
 };
 
 /// Snapshot states (`--state NAME[:ARG]`).
@@ -47,6 +44,8 @@ pub const STATES: &[&str] = &[
     "set-number:FIELD=VALUE",
     "set-flag:FIELD=VALUE",
     "choose-service:ID",
+    "destination:ID",
+    "add-destination",
     "iso-source:ID",
     "advanced-quality",
     "connecting",
@@ -103,7 +102,7 @@ const TABS: &[(&str, &str, &str, &str, &str)] = &[
         "General",
         "sun",
         "System",
-        "This setup's name, snapping in the preview, how often the preview draws, and app updates.",
+        "This setup's name, snapping in the preview, how often the preview draws, app updates and permissions.",
     ),
     (
         "hotkeys",
@@ -323,6 +322,10 @@ struct Draft {
     notice: String,
     /// Custom and Kick ask for a server before streaming is set up.
     needs_server: String,
+    /// The stream destination open in Stream (`main` or an id in
+    /// `stream.destinations`), and whether one is being added (#73).
+    destination: String,
+    adding: bool,
     applying: bool,
     /// Why the daemon refused the last Apply/OK ("" if it didn't).
     refused: String,
@@ -344,8 +347,6 @@ struct FirstRun {
     folder: String,
     name: String,
     creating: bool,
-    report: Option<PermissionsReport>,
-    asking: bool,
 }
 
 impl Default for FirstRun {
@@ -362,8 +363,6 @@ impl Default for FirstRun {
             folder: "~/Movies/Isocast".into(),
             name: "My setup".into(),
             creating: false,
-            report: None,
-            asking: false,
         }
     }
 }
@@ -371,14 +370,14 @@ impl Default for FirstRun {
 #[derive(Default)]
 pub struct Settings {
     draft: RefCell<Option<Draft>>,
+    /// The draft kept while the permissions step stands in for Settings
+    /// (its Review…), for Settings to open with again.
+    parked: RefCell<Option<Draft>>,
     first_run: RefCell<FirstRun>,
     /// Looking for devices again (Audio, the first run).
     looking: std::cell::Cell<bool>,
     /// Welcome's choice that is working ("obs", "file").
     welcome_busy: RefCell<String>,
-    /// Checks the permissions every few seconds while the first run's
-    /// first step shows (granted in System Settings meanwhile).
-    permissions_timer: slint::Timer,
     /// The Hotkeys page (src/areas/hotkeys.rs).
     pub hotkeys: super::hotkeys::HotkeysPage,
     /// Help › Report a Bug… (src/areas/report.rs).
@@ -473,6 +472,9 @@ impl Area for Settings {
         on!(on_set_iso_source, |app, id, on| app
             .settings
             .set_iso_source(&app, &id, on));
+        on!(on_set_iso_audio, |app, id, audio| app
+            .settings
+            .set_iso_audio(&app, &id, &audio));
         on!(on_set_mic, |app, id, device| {
             if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
                 d.mics.insert(id.into(), device.into());
@@ -492,19 +494,51 @@ impl Area for Settings {
                     .as_mut()
                     .map(|d| std::mem::take(&mut d.needs_server));
                 if let Some(service) = service {
-                    app.settings.change(
-                        &app,
-                        json!({"stream": {"service": service, "server": server}}),
-                    );
+                    let adding = app
+                        .settings
+                        .draft
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|d| d.adding);
+                    if adding {
+                        app.settings.add_destination(&app, &service, Some(&server));
+                    } else {
+                        app.settings.change(
+                            &app,
+                            json!({"stream": {"service": service, "server": server}}),
+                        );
+                    }
                 }
             }
         });
         on!(on_server_back, |app| {
             if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
+                if d.needs_server.is_empty() {
+                    d.adding = false;
+                }
                 d.needs_server.clear();
             }
             app.settings.show(&app);
         });
+        on!(on_select_destination, |app, id| {
+            if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
+                d.destination = id.into();
+            }
+            app.settings.show(&app);
+        });
+        on!(on_add_destination, |app| {
+            if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
+                d.adding = true;
+                d.needs_server.clear();
+            }
+            app.settings.show(&app);
+        });
+        on!(on_remove_destination, |app| app
+            .settings
+            .remove_destination(&app));
+        on!(on_set_destination_enabled, |app, id, on| app
+            .settings
+            .set_destination_enabled(&app, &id, on));
         on!(on_save_key, |app, key| app.settings.save_key(&app, &key));
         on!(on_clear_key, |app| app.settings.clear_key(&app));
         on!(on_browse_folder, |app| {
@@ -545,26 +579,6 @@ impl Area for Settings {
             app.settings.show_first_run(&app);
         });
         on!(on_ob_create, |app| app.settings.create_setup(&app));
-        on!(on_ob_check, |app| app.settings.check_permissions(&app));
-        on!(on_ob_ask, |app| app.settings.ask_permissions(&app));
-        on!(on_ob_restart_engine, |app| app
-            .settings
-            .restart_engine(&app));
-        on!(on_ob_open_settings, |app, permission| {
-            let kind = match permission.as_str() {
-                "screen_recording" => PermissionKind::ScreenRecording,
-                "camera" => PermissionKind::Camera,
-                _ => PermissionKind::Microphone,
-            };
-            app.call(
-                Method::OpenPermissionSettings { permission: kind },
-                |app, result| {
-                    if let Err(error) = result {
-                        app.failed("Couldn’t open System Settings", &error);
-                    }
-                },
-            );
-        });
         on!(on_ob_set, |app, field, value| app
             .settings
             .first_run_set(&app, &field, &value));
@@ -641,16 +655,22 @@ impl Area for Settings {
         } else {
             TABS[0].0
         };
-        let prefs = Prefs::read(&window.global::<Ui>());
-        let base = app.session.borrow().setup_json().map(pick);
-        *self.draft.borrow_mut() = base.map(|base| Draft {
-            draft: base.clone(),
-            base,
-            prefs_base: prefs.clone(),
-            prefs,
-            notice,
-            ..Draft::default()
-        });
+        let parked = self.parked.borrow_mut().take();
+        if let Some(parked) = parked {
+            // Back from the permissions step: its edits as they were.
+            *self.draft.borrow_mut() = Some(parked);
+        } else {
+            let prefs = Prefs::read(&window.global::<Ui>());
+            let base = app.session.borrow().setup_json().map(pick);
+            *self.draft.borrow_mut() = base.map(|base| Draft {
+                draft: base.clone(),
+                base,
+                prefs_base: prefs.clone(),
+                prefs,
+                notice,
+                ..Draft::default()
+            });
+        }
         area.set_tab(tab.into());
         area.set_quality_advanced(false);
         self.tab_shown(app, tab);
@@ -698,6 +718,17 @@ impl Area for Settings {
                 }
             }
             "choose-service" => self.choose_service(app, arg),
+            // Stream's destination `arg` open, or the services to add one.
+            "destination" | "add-destination" => {
+                if let Some(d) = self.draft.borrow_mut().as_mut() {
+                    if name == "destination" {
+                        d.destination = arg.to_string();
+                    } else {
+                        d.adding = true;
+                    }
+                }
+                self.show(app);
+            }
             // Settings → Hotkeys with sample bindings (no profile changes),
             // and a row waiting for its keys.
             "hotkeys-sample" => {
@@ -758,6 +789,12 @@ impl Area for Settings {
 impl Settings {
     // ---------- The Settings dialog ----------
 
+    /// Keep the open draft, unsaved edits and all, for the next time
+    /// Settings opens (the permissions step stands in for it a while).
+    pub fn park(&self) {
+        *self.parked.borrow_mut() = self.draft.borrow_mut().take();
+    }
+
     /// Close Settings, dropping its draft and why it opened.
     fn close(&self, app: &Rc<App>) {
         *self.draft.borrow_mut() = None;
@@ -814,16 +851,14 @@ impl Settings {
                 return self.set_prefs(app, |p| p.preview_rate = rate);
             }
             "service" => {
-                let same = self
-                    .draft_value(&["stream", "service"])
-                    .is_some_and(|s| s == value);
+                let open = self.open_destination();
+                let same = open.get("service").is_some_and(|s| s == value);
                 let server = if same {
-                    self.draft_value(&["stream", "server"])
-                        .unwrap_or(Value::Null)
+                    open.get("server").cloned().unwrap_or(Value::Null)
                 } else {
                     Value::Null
                 };
-                json!({"stream": {"service": value, "server": server}})
+                return self.change_destination(app, json!({"service": value, "server": server}));
             }
             "server" => {
                 let server = if trimmed.is_empty() {
@@ -831,7 +866,25 @@ impl Settings {
                 } else {
                     json!(trimmed)
                 };
-                json!({"stream": {"server": server}})
+                return self.change_destination(app, json!({"server": server}));
+            }
+            "destination_bitrate" => {
+                let kbps = if value == "own" {
+                    json!(
+                        self.draft_value(&["stream", "video_bitrate_kbps"])
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(6000)
+                    )
+                } else {
+                    Value::Null
+                };
+                return self.change_destination(app, json!({"video_bitrate_kbps": kbps}));
+            }
+            "destination_size" if value == "custom" => {
+                return self.change_destination(app, json!({"width": 1280, "height": 720}));
+            }
+            "destination_size" => {
+                return self.change_destination(app, json!({"width": null, "height": null}));
             }
             "rate_control" => json!({"stream": {"rate_control": value}}),
             "audio_bitrate" => match value.parse::<u32>() {
@@ -899,11 +952,25 @@ impl Settings {
             }
             "video_bitrate" => json!({"stream": {"video_bitrate_kbps": whole}}),
             "keyframe_interval" => json!({"stream": {"keyframe_interval_seconds": whole}}),
+            "destination_bitrate" => {
+                return self.change_destination(app, json!({"video_bitrate_kbps": whole}));
+            }
+            "destination_width" => return self.change_destination(app, json!({"width": whole})),
+            "destination_height" => {
+                return self.change_destination(app, json!({"height": whole}));
+            }
             "stream_width" => json!({"stream": {"width": whole}}),
             "stream_height" => json!({"stream": {"height": whole}}),
             "program_quality" => json!({"recording": {"program": {"encoder": {"quality": whole}}}}),
             "iso_quality" => json!({"recording": {"iso": {"encoder": {"quality": whole}}}}),
             "keep_free" => json!({"recording": {"keep_free_gb": value as f64}}),
+            "replay_seconds" => json!({"recording": {"replay": {"seconds": whole.clamp(
+                i64::from(isocast_protocol::replay::MIN_SECONDS),
+                i64::from(isocast_protocol::replay::MAX_SECONDS),
+            )}}}),
+            "replay_memory" => {
+                json!({"recording": {"replay": {"max_memory_mb": whole.clamp(16, 8192)}}})
+            }
             "canvas_width" => json!({"canvas": {"width": whole}}),
             "canvas_height" => json!({"canvas": {"height": whole}}),
             "reconnect_delay" => json!({"stream": {"reconnect": {"delay_seconds": whole}}}),
@@ -924,14 +991,47 @@ impl Settings {
             "iso_filtered" => json!({"recording": {"iso": {"filtered": on}}}),
             "reconnect" => json!({"stream": {"reconnect": {"enabled": on}}}),
             "developer" => json!({"developer": {"enabled": on}}),
+            // Back on: the hours it had (a custom `auto_off_hours` too).
             "developer_auto_off" => json!({"developer": {"auto_off_hours": if on {
-                isocast_protocol::developer::DEFAULT_AUTO_OFF_HOURS
+                self.auto_off_hours()
             } else {
                 0
             }}}),
             _ => return,
         };
         self.change(app, patch);
+    }
+
+    /// Developer mode's hours until it turns itself off when the switch is
+    /// on: the draft's, else the applied setting's, else the default (#55).
+    fn auto_off_hours(&self) -> u64 {
+        let guard = self.draft.borrow();
+        let d = guard.as_ref();
+        [d.map(|d| &d.draft), d.map(|d| &d.base)]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v["developer"]["auto_off_hours"].as_u64())
+            .find(|&hours| hours > 0)
+            .unwrap_or(isocast_protocol::developer::DEFAULT_AUTO_OFF_HOURS.into())
+    }
+
+    /// The live setup with the draft's ISO settings, for the ISO audio
+    /// menus.
+    fn drafted(&self, app: &Rc<App>) -> Option<Setup> {
+        let iso = self.draft_value(&["recording", "iso"])?;
+        draft_setup(app.session.borrow().setup.as_deref(), &iso)
+    }
+
+    /// Video source `source`'s ISO file: back to the other files' audio
+    /// (`default`), or with audio source `audio` added or taken out.
+    fn set_iso_audio(&self, app: &Rc<App>, source: &str, audio: &str) {
+        if let Some(setup) = self.drafted(app) {
+            let list = super::sources::items::toggled_iso_audio(&setup, source, audio);
+            self.change(
+                app,
+                json!({"recording": {"iso": {"source_audio": {source: list}}}}),
+            );
+        }
     }
 
     fn set_iso_source(&self, app: &Rc<App>, id: &str, on: bool) {
@@ -947,13 +1047,144 @@ impl Settings {
     }
 
     fn choose_service(&self, app: &Rc<App>, id: &str) {
+        let adding = self.draft.borrow().as_ref().is_some_and(|d| d.adding);
         if id == "custom" || id == "kick" {
             if let Some(d) = self.draft.borrow_mut().as_mut() {
                 d.needs_server = id.to_string();
             }
             self.show(app);
+        } else if adding {
+            self.add_destination(app, id, None);
         } else {
             self.change(app, json!({"stream": {"service": id}}));
+        }
+    }
+
+    /// The open destination, as the draft has it: `[stream]` itself for
+    /// the main one, else its entry in `stream.destinations`.
+    fn open_destination(&self) -> Map<String, Value> {
+        let id = self.open_id();
+        let value = if id == MAIN_DESTINATION {
+            self.draft_value(&["stream"])
+        } else {
+            self.draft_value(&["stream", "destinations"])
+                .and_then(|list| {
+                    list.as_array()?
+                        .iter()
+                        .find(|d| d["id"] == id.as_str())
+                        .cloned()
+                })
+        };
+        value
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    /// The open destination's id, if the draft still has it (else main).
+    fn open_id(&self) -> String {
+        let guard = self.draft.borrow();
+        let Some(d) = guard.as_ref() else {
+            return MAIN_DESTINATION.into();
+        };
+        let known = d.draft["stream"]["destinations"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|x| x["id"] == d.destination.as_str()));
+        if known {
+            d.destination.clone()
+        } else {
+            MAIN_DESTINATION.into()
+        }
+    }
+
+    /// Change the open destination's `fields` (a null removes one).
+    fn change_destination(&self, app: &Rc<App>, fields: Value) {
+        let id = self.open_id();
+        if id == MAIN_DESTINATION {
+            return self.change(app, json!({"stream": fields}));
+        }
+        self.change_extra(app, &id, fields);
+    }
+
+    /// Change destination `id` (not main) in `stream.destinations`: the
+    /// list goes whole, as a merge patch replaces arrays.
+    fn change_extra(&self, app: &Rc<App>, id: &str, fields: Value) {
+        let mut list = self
+            .draft_value(&["stream", "destinations"])
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        if let Some(entry) = list
+            .iter_mut()
+            .find(|d| d["id"] == id)
+            .and_then(Value::as_object_mut)
+            && let Some(fields) = fields.as_object()
+        {
+            for (key, value) in fields {
+                if value.is_null() {
+                    entry.remove(key);
+                } else {
+                    entry.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        self.change(app, json!({"stream": {"destinations": list}}));
+    }
+
+    /// Add a destination of `service` to the draft and open it.
+    fn add_destination(&self, app: &Rc<App>, service: &str, server: Option<&str>) {
+        let mut list = self
+            .draft_value(&["stream", "destinations"])
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let taken = |id: &str| id == MAIN_DESTINATION || list.iter().any(|d| d["id"] == id);
+        let id = (1..)
+            .map(|n| {
+                if n == 1 {
+                    service.to_string()
+                } else {
+                    format!("{service}-{n}")
+                }
+            })
+            .find(|id| !taken(id))
+            .expect("a free id");
+        let mut entry = json!({"id": id, "service": service});
+        if let Some(server) = server {
+            entry["server"] = json!(server);
+        }
+        list.push(entry);
+        if let Some(d) = self.draft.borrow_mut().as_mut() {
+            d.adding = false;
+            d.needs_server.clear();
+            d.destination = id;
+        }
+        self.change(app, json!({"stream": {"destinations": list}}));
+    }
+
+    fn remove_destination(&self, app: &Rc<App>) {
+        let id = self.open_id();
+        if id == MAIN_DESTINATION {
+            return;
+        }
+        let mut list = self
+            .draft_value(&["stream", "destinations"])
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        list.retain(|d| d["id"] != id.as_str());
+        if let Some(d) = self.draft.borrow_mut().as_mut() {
+            d.destination = MAIN_DESTINATION.into();
+        }
+        self.change(app, json!({"stream": {"destinations": list}}));
+    }
+
+    fn set_destination_enabled(&self, app: &Rc<App>, id: &str, on: bool) {
+        if id == MAIN_DESTINATION {
+            self.change(app, json!({"stream": {"enabled": on}}));
+        } else {
+            // On is the default: left out of the setup.
+            self.change_extra(
+                app,
+                id,
+                json!({"enabled": if on { Value::Null } else { json!(false) }}),
+            );
         }
     }
 
@@ -1004,23 +1235,30 @@ impl Settings {
         );
     }
 
-    /// Which key: the draft's service, and its server for a custom one.
+    /// Which key: the open destination's service, and its server for a
+    /// custom one; an added destination's own (its id with them).
     fn key_target(&self) -> Option<StreamKeyTarget> {
-        let service: StreamService =
-            serde_json::from_value(self.draft_value(&["stream", "service"])?).ok()?;
+        let id = self.open_id();
+        let open = self.open_destination();
+        let service: StreamService = serde_json::from_value(open.get("service")?.clone()).ok()?;
         let server = (service == StreamService::Custom)
-            .then(|| self.draft_value(&["stream", "server"]))
+            .then(|| open.get("server").cloned())
             .flatten()
             .and_then(|v| v.as_str().map(str::to_string))
             .filter(|s| !s.is_empty());
         Some(StreamKeyTarget {
+            destination: (id != MAIN_DESTINATION).then_some(id),
             service: Some(service),
             server,
         })
     }
 
     fn set_key_busy(&self, app: &Rc<App>, busy: bool) {
+        // Parked meanwhile (Review…): the parked draft's, so its buttons
+        // aren't left disabled on return (#58).
         if let Some(d) = self.draft.borrow_mut().as_mut() {
+            d.key_busy = busy;
+        } else if let Some(d) = self.parked.borrow_mut().as_mut() {
             d.key_busy = busy;
         }
         self.show(app);
@@ -1094,7 +1332,12 @@ impl Settings {
         app.edit_then(patch, EditOptions::default(), move |app, ok| {
             let settings = &app.settings;
             let refusal = app.session.borrow_mut().last_refusal.take();
-            if let Some(d) = settings.draft.borrow_mut().as_mut() {
+            // Parked meanwhile (Review… opened the permissions step): the
+            // parked draft takes the answer, and that step stays open.
+            let parked = settings.draft.borrow().is_none() && settings.parked.borrow().is_some();
+            let mut draft = settings.draft.borrow_mut();
+            let mut parked_draft = settings.parked.borrow_mut();
+            if let Some(d) = draft.as_mut().or(parked_draft.as_mut()) {
                 d.applying = false;
                 if ok {
                     d.base = d.draft.clone();
@@ -1106,12 +1349,16 @@ impl Settings {
                     });
                 }
             }
+            drop((draft, parked_draft));
             if ok {
                 app.refresh_status(true);
-                if close {
-                    settings.close(app);
-                    return;
-                }
+            }
+            if parked {
+                return;
+            }
+            if ok && close {
+                settings.close(app);
+                return;
             }
             settings.show(app);
         });
@@ -1188,21 +1435,101 @@ impl Settings {
         area.set_updates_available(crate::update::available());
         area.set_auto_updates(d.prefs.auto_updates);
 
-        // Stream
+        // Stream: the destinations, and the open one's service, server
+        // and key (#73).
         let stream = &draft["stream"];
         let has_stream = stream.is_object();
-        let status = s.stream.as_ref();
-        let service = text(&stream["service"]);
+        let open_id = {
+            let known = stream["destinations"]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|x| x["id"] == d.destination.as_str()));
+            if known {
+                d.destination.clone()
+            } else {
+                MAIN_DESTINATION.to_string()
+            }
+        };
+        let status_of = |id: &str| -> Option<&StreamStatus> {
+            s.streams
+                .iter()
+                .find(|x| x.id == id)
+                .or_else(|| s.stream.as_ref().filter(|x| x.id == id))
+        };
+        let mut rows = Vec::new();
+        if has_stream {
+            let mut entries = vec![(MAIN_DESTINATION.to_string(), stream.clone())];
+            for extra in stream["destinations"].as_array().into_iter().flatten() {
+                entries.push((text(&extra["id"]), extra.clone()));
+            }
+            let main_size = (stream["width"].clone(), stream["height"].clone());
+            let main_kbps = stream["video_bitrate_kbps"].clone();
+            for (id, entry) in &entries {
+                let status = status_of(id);
+                let service = text(&entry["service"]);
+                let label = match (id.as_str(), service_label(&service)) {
+                    (MAIN_DESTINATION, name) => name.to_string(),
+                    (id, name) if id == service => name.to_string(),
+                    (id, name) => format!("{id} · {name}"),
+                };
+                let own = id != MAIN_DESTINATION
+                    && ((!entry["video_bitrate_kbps"].is_null()
+                        && entry["video_bitrate_kbps"] != main_kbps)
+                        || (!entry["width"].is_null()
+                            && (entry["width"].clone(), entry["height"].clone()) != main_size));
+                let same_service = status
+                    .and_then(|x| serde_json::to_value(x.service).ok())
+                    .is_some_and(|v| v == entry["service"]);
+                let words = match status.map(|x| x.state) {
+                    Some(StreamState::Live) => "Live",
+                    Some(StreamState::Connecting) => "Connecting",
+                    Some(StreamState::Reconnecting) => "Reconnecting",
+                    Some(StreamState::Failed) => "Failed",
+                    _ if !same_service => "Not saved yet",
+                    _ if !status.is_some_and(|x| x.key_set) => "No key yet",
+                    _ if own => "Own encoder",
+                    _ => "Key saved",
+                };
+                rows.push(DestinationRow {
+                    id: id.as_str().into(),
+                    label: label.into(),
+                    status: words.into(),
+                    enabled: entry["enabled"].as_bool().unwrap_or(true),
+                });
+            }
+        }
+        area.set_destinations(model(rows));
+        area.set_destination(open_id.as_str().into());
+        area.set_adding_destination(d.adding);
+        let open = if open_id == MAIN_DESTINATION {
+            stream.clone()
+        } else {
+            stream["destinations"]
+                .as_array()
+                .and_then(|list| list.iter().find(|x| x["id"] == open_id.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        area.set_destination_live(status_of(&open_id).is_some_and(|x| x.is_active()));
+        area.set_destination_own_bitrate(!open["video_bitrate_kbps"].is_null());
+        area.set_destination_bitrate(number(
+            &open["video_bitrate_kbps"],
+            number(&stream["video_bitrate_kbps"], 6000.0).into(),
+        ));
+        area.set_destination_own_size(!open["width"].is_null());
+        area.set_destination_width(number(&open["width"], 1280.0));
+        area.set_destination_height(number(&open["height"], 720.0));
+        let status = status_of(&open_id);
+        let service = text(&open["service"]);
         let status_service = status
             .and_then(|x| serde_json::to_value(x.service).ok())
             .and_then(|v| v.as_str().map(str::to_string));
         let key_set = status.is_some_and(|x| x.key_set);
-        let ready = has_stream && key_set;
+        let ready = has_stream && s.stream.as_ref().is_some_and(|x| x.key_set);
         area.set_notice(if ready { "" } else { d.notice.as_str() }.into());
         area.set_refused(d.refused.as_str().into());
         area.set_has_stream(has_stream);
         area.set_needs_server(d.needs_server.as_str().into());
-        area.set_stream_live(status.is_some_and(|x| {
+        area.set_stream_live(s.stream.as_ref().is_some_and(|x| {
             matches!(
                 x.state,
                 StreamState::Live | StreamState::Connecting | StreamState::Reconnecting
@@ -1210,7 +1537,7 @@ impl Settings {
         }));
         let preset = preset_server(&service);
         area.set_service(service.as_str().into());
-        area.set_server(text(&stream["server"]).into());
+        area.set_server(text(&open["server"]).into());
         area.set_server_placeholder(preset.unwrap_or("rtmps://…").into());
         area.set_server_hint(
             if preset.is_some() {
@@ -1253,6 +1580,8 @@ impl Settings {
         area.set_folder(text(&rec["folder"]).into());
         area.set_folder_short(middle_short(&text(&rec["folder"])).into());
         area.set_keep_free(number(&rec["keep_free_gb"], 1.0));
+        area.set_replay_seconds(number(&rec["replay"]["seconds"], 30.0));
+        area.set_replay_memory(number(&rec["replay"]["max_memory_mb"], 1024.0));
         let program_on = program["enabled"] != json!(false);
         let iso_on = iso["enabled"] == json!(true);
         let codec = |encoder: &Value| encoder["codec"].as_str().unwrap_or("hevc").to_string();
@@ -1309,8 +1638,9 @@ impl Settings {
             .as_array()
             .map(|list| list.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let drafted = draft_setup(s.setup.as_deref(), &draft["recording"]["iso"]);
         area.set_iso_sources(model(
-            s.setup
+            drafted
                 .iter()
                 .flat_map(|setup| setup.sources.iter())
                 .filter(|source| source.kind.has_video())
@@ -1318,6 +1648,25 @@ impl Settings {
                     id: source.id.as_str().into(),
                     name: crate::model::source_name(source).into(),
                     on: chosen.contains(&source.id.as_str()),
+                    shared_audio: drafted.as_ref().is_some_and(|setup| {
+                        !setup.recording.iso.source_audio.contains_key(&source.id)
+                    }),
+                    tracks: model(drafted.iter().flat_map(|setup| {
+                        let tracks = setup
+                            .recording
+                            .iso
+                            .audio_for(source, source.kind.has_audio());
+                        setup
+                            .sources
+                            .iter()
+                            .filter(|a| a.kind.has_audio())
+                            .map(move |a| IsoTrack {
+                                id: a.id.as_str().into(),
+                                name: crate::model::source_name(a).into(),
+                                on: tracks.contains(&a.id),
+                            })
+                            .collect::<Vec<_>>()
+                    })),
                 }),
         ));
 
@@ -1396,6 +1745,14 @@ impl Settings {
         let developer = &draft["developer"];
         area.set_developer_on(developer["enabled"] == json!(true));
         area.set_developer_auto_off(developer["auto_off_hours"] != json!(0));
+        let hours = self.auto_off_hours();
+        area.set_developer_auto_off_label(
+            format!(
+                "Turn Off After {hours} Hour{}",
+                if hours == 1 { "" } else { "s" }
+            )
+            .into(),
+        );
 
         // The summary: what the draft makes, how fast its program file
         // fills the disk (the estimate the engine's free-space check uses,
@@ -1465,6 +1822,7 @@ impl Settings {
             ],
             "program" => &[&["recording", "program"]],
             "iso" => &[&["recording", "iso"]],
+            "replay" => &[&["recording", "replay"]],
             _ => return,
         };
         if let Some(d) = self.draft.borrow_mut().as_mut() {
@@ -1522,8 +1880,13 @@ impl Settings {
         }
     }
 
-    /// Ask for an OBS scene collection and make it the live setup.
+    /// Ask for an OBS scene collection and make it the live setup (or,
+    /// when OBS's own were found, offer those: area I).
     fn import_obs(&self, app: &Rc<App>) {
+        if app.wizard.has_found() {
+            app.wizard.open_obs(app);
+            return;
+        }
         if let Some(path) = choose_file(app, &["json"], "Import") {
             self.import_obs_path(app, &path);
         }
@@ -1626,95 +1989,16 @@ impl Settings {
         }
         // Ask for the devices now, so they're there by the second step.
         app.load_devices(true);
-        self.check_permissions(app);
-        if !app.mode.offscreen {
-            let weak = Rc::downgrade(app);
-            self.permissions_timer.start(
-                slint::TimerMode::Repeated,
-                Duration::from_secs(4),
-                move || {
-                    if let Some(app) = weak.upgrade() {
-                        let checking = app.settings.first_run.borrow().step == 0;
-                        if checking {
-                            app.settings.check_permissions(&app);
-                        }
-                    }
-                },
-            );
-        }
+        // The Permissions step draws the permissions step's rows (area H),
+        // which read the permissions every second while it shows.
+        app.permissions.check(app);
         self.show_first_run(app);
     }
 
     fn close_first_run(&self, app: &Rc<App>) {
-        self.permissions_timer.stop();
         if let Some(window) = app.window() {
             window.global::<Ui>().set_onboarding(false);
         }
-    }
-
-    fn check_permissions(&self, app: &Rc<App>) {
-        app.call_as::<PermissionsReport>(Method::Permissions, |app, result| match result {
-            Ok(next) => {
-                let granted = |r: &PermissionsReport| {
-                    r.details
-                        .iter()
-                        .filter(|d| d.state == Permission::Granted)
-                        .count()
-                };
-                let more = {
-                    let mut run = app.settings.first_run.borrow_mut();
-                    let more = run
-                        .report
-                        .as_ref()
-                        .is_some_and(|before| granted(&next) > granted(before));
-                    run.report = Some(next);
-                    more
-                };
-                // Newly allowed: what can be listed changed.
-                if more {
-                    app.load_devices(true);
-                }
-                app.settings.show_first_run(app);
-            }
-            Err(error) => app.failed("Couldn’t check permissions", &error),
-        });
-    }
-
-    fn ask_permissions(&self, app: &Rc<App>) {
-        self.first_run.borrow_mut().asking = true;
-        self.show_first_run(app);
-        app.call_as::<PermissionsReport>(Method::RequestPermissions, |app, result| {
-            {
-                let mut run = app.settings.first_run.borrow_mut();
-                run.asking = false;
-                if let Ok(report) = &result {
-                    run.report = Some(report.clone());
-                }
-            }
-            if let Err(error) = result {
-                app.failed("Couldn’t ask for permissions", &error);
-            }
-            app.settings.show_first_run(app);
-        });
-    }
-
-    /// Restart isocastd so it picks up a permission granted while it ran;
-    /// the link reconnects (and launches it) by itself.
-    fn restart_engine(&self, app: &Rc<App>) {
-        app.call(Method::Shutdown, |app, _| {
-            app.reload();
-            app.toast(
-                ToastKind::Info,
-                "Restarting the engine",
-                "It picks up the new permission when it starts again.",
-            );
-            let weak = Rc::downgrade(app);
-            slint::Timer::single_shot(Duration::from_secs(3), move || {
-                if let Some(app) = weak.upgrade() {
-                    app.settings.check_permissions(&app);
-                }
-            });
-        });
     }
 
     fn first_run_set(&self, app: &Rc<App>, field: &str, value: &str) {
@@ -1777,6 +2061,8 @@ impl Settings {
                     app.reload();
                     app.refresh_status(false);
                     app.settings.close_first_run(app);
+                    // Then optimize it (area I).
+                    app.wizard.open_goal(app);
                     let scenes = made["setup"]["scenes"].as_array().map_or(0, Vec::len);
                     app.toast(
                         ToastKind::Success,
@@ -1805,85 +2091,6 @@ impl Settings {
         area.set_step(run.step);
         area.set_can_close(s.setup.is_some());
         area.set_creating(run.creating);
-        area.set_asking(run.asking);
-
-        // Permissions
-        area.set_checked(run.report.is_some());
-        let report = run.report.as_ref();
-        let details = report.map(|r| r.details.as_slice()).unwrap_or_default();
-        area.set_any_to_ask(
-            details
-                .iter()
-                .any(|d| d.action == PermissionAction::Request),
-        );
-        let app_name = report.map_or("Isocast", |r| r.app.as_str());
-        area.set_permissions(model(details.iter().map(|d| {
-            let (icon, title, why, pane) = match d.permission {
-                PermissionKind::ScreenRecording => (
-                    "display",
-                    "Screen recording",
-                    "Displays, windows and system audio",
-                    "Screen & System Audio Recording",
-                ),
-                PermissionKind::Camera => (
-                    "camera",
-                    "Camera",
-                    "Cameras, capture cards and iPhones",
-                    "Camera",
-                ),
-                PermissionKind::Microphone => (
-                    "mic",
-                    "Microphone",
-                    "Microphones and audio interfaces",
-                    "Microphone",
-                ),
-            };
-            let granted = d.state == Permission::Granted;
-            let todo = match d.action {
-                PermissionAction::OpenSettings => format!(
-                    "Turn on “{app_name}” in System Settings → Privacy & Security → {pane}.{}",
-                    if d.restart_after_granting {
-                        " Then"
-                    } else {
-                        ""
-                    }
-                ),
-                PermissionAction::AskAdministrator => {
-                    "A policy on this Mac blocks it; ask its administrator.".to_string()
-                }
-                _ => String::new(),
-            };
-            let state = match d.state {
-                Permission::Granted => "Allowed",
-                Permission::Denied => "Turned off",
-                Permission::NotDetermined => "Not asked yet",
-                Permission::Restricted => "Blocked by a policy",
-                _ => "Not allowed",
-            };
-            let hint = if d.needed_for.is_empty() {
-                why.to_string()
-            } else {
-                sentence(&d.needed_for)
-            };
-            PermissionRow {
-                id: PermissionKind::NAMES[PermissionKind::ALL
-                    .iter()
-                    .position(|k| *k == d.permission)
-                    .unwrap_or(0)]
-                .into(),
-                icon: icon.into(),
-                title: title.into(),
-                hint: hint.into(),
-                todo: if granted { String::new() } else { todo }.into(),
-                restart: !granted
-                    && d.action == PermissionAction::OpenSettings
-                    && d.restart_after_granting,
-                state: state.into(),
-                granted,
-                denied: d.state == Permission::Denied,
-                open_settings: d.action == PermissionAction::OpenSettings,
-            }
-        })));
 
         // Devices
         let devices = s.devices.as_ref();
@@ -2032,6 +2239,13 @@ impl Settings {
 }
 
 /// The parts of a setup Settings changes.
+/// `setup` with ISO settings `iso` (the draft's), if they read as such.
+fn draft_setup(setup: Option<&Setup>, iso: &Value) -> Option<Setup> {
+    let mut setup = setup?.clone();
+    setup.recording.iso = serde_json::from_value(iso.clone()).ok()?;
+    Some(setup)
+}
+
 fn pick(setup: &Value) -> Value {
     let mut out = json!({
         "name": setup["name"],
@@ -2262,4 +2476,16 @@ fn mp4_ok(codec: &str) -> bool {
     serde_json::from_value::<isocast_protocol::Codec>(json!(codec))
         .map(|c| c.containers().contains(&isocast_protocol::Container::Mp4))
         .unwrap_or(true)
+}
+
+/// A service's name as Settings shows it.
+fn service_label(service: &str) -> &'static str {
+    match service {
+        "twitch" => "Twitch",
+        "youtube" => "YouTube",
+        "kick" => "Kick",
+        "facebook" => "Facebook",
+        "custom" => "Custom server",
+        _ => "Stream",
+    }
 }

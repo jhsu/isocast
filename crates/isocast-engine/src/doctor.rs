@@ -35,16 +35,24 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
     let uses = |f: fn(&SourceKind) -> bool| kinds.iter().any(|kind| f(kind));
     match platform.permissions() {
         Ok(report) => {
+            // System and app audio use system audio recording where it's
+            // granted, else screen recording; neither alone is required.
             let screen = uses(|k| {
                 matches!(
                     k,
-                    SourceKind::Display(_)
-                        | SourceKind::Window(_)
-                        | SourceKind::Application(_)
-                        | SourceKind::ApplicationAudio(_)
-                        | SourceKind::SystemAudio(_)
+                    SourceKind::Display(_) | SourceKind::Window(_) | SourceKind::Application(_)
                 )
             });
+            let played = uses(|k| {
+                matches!(
+                    k,
+                    SourceKind::ApplicationAudio(_) | SourceKind::SystemAudio(_)
+                )
+            });
+            let either = |kind| report.permissions.get(kind) == Permission::Granted;
+            let played_missing = played
+                && !either(PermissionKind::ScreenRecording)
+                && !either(PermissionKind::SystemAudio);
             let camera = uses(|k| matches!(k, SourceKind::Camera(_)));
             let microphone = uses(|k| matches!(k, SourceKind::Microphone(_)));
             for detail in &report.details {
@@ -52,6 +60,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
                     PermissionKind::ScreenRecording => screen,
                     PermissionKind::Camera => camera,
                     PermissionKind::Microphone => microphone,
+                    PermissionKind::SystemAudio => played_missing,
                 };
                 let name = format!("permission: {}", detail.permission.label());
                 let fix = detail.next_step.as_deref();
@@ -160,6 +169,8 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
             Some("pick a codec listed under hardware encoders"),
         ));
     }
+    // Whether the files fit the media engines (#66).
+    checks.extend(crate::estimate::check(platform, setup, None));
 
     // Every source the recording uses, resolved to a device: ISO files
     // and their audio, and the program's audio (a recording won't start
@@ -173,7 +184,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
         needed.extend(
             iso.sources
                 .iter()
-                .chain(iso.audio.iter().flatten())
+                .chain(iso.listed_audio())
                 .map(String::as_str),
         );
     }
@@ -277,6 +288,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
                 encoder: encoder.clone(),
             },
             audio,
+            created: std::time::SystemTime::now(),
         })
     };
     let mut rate = 0.0;

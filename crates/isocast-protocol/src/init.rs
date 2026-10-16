@@ -318,7 +318,7 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
         sources.push(source(
             "desktop-audio",
             "Desktop Audio",
-            SourceKind::SystemAudio(SystemAudioSource {}),
+            SourceKind::SystemAudio(SystemAudioSource::default()),
         ));
         notes.push("Desktop audio: what this Mac plays, in the program.".into());
     }
@@ -386,6 +386,7 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
                 ..IsoRecording::default()
             },
             keep_free_gb: 1.0,
+            replay: Default::default(),
         },
     };
     let problems = setup.validate();
@@ -687,10 +688,12 @@ mod tests {
                 channels: 1,
             }],
             audio_outputs: Vec::new(),
+            audio_apps: Vec::new(),
             permissions: Permissions {
                 screen_recording: permission,
                 camera: permission,
                 microphone: permission,
+                system_audio: permission,
             },
             notes: Vec::new(),
         }

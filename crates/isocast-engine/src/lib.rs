@@ -12,6 +12,7 @@ mod content;
 pub mod data;
 pub mod doctor;
 pub(crate) mod draw_list;
+pub mod estimate;
 pub mod filter;
 pub mod gpu;
 pub mod hotkeys;
@@ -21,6 +22,7 @@ mod picture;
 pub mod project;
 pub mod record;
 pub mod render;
+pub mod replay;
 pub mod scene;
 pub mod snapshot;
 pub(crate) mod source;
@@ -112,9 +114,12 @@ pub trait Platform: Clone + Send + Sync + 'static {
     }
 
     /// Ask the OS for screen recording, camera and microphone access where
-    /// it hasn't been decided, showing its prompts, and wait a while for
-    /// the answers. Returns the permissions afterwards.
-    fn request_permissions(&self) -> anyhow::Result<PermissionsReport>;
+    /// it hasn't been decided (only `only`, if given), showing its prompts,
+    /// and wait a while for the answers. Returns the permissions afterwards.
+    fn request_permissions(
+        &self,
+        only: Option<PermissionKind>,
+    ) -> anyhow::Result<PermissionsReport>;
 
     /// Open the settings where `permission` is turned on by hand. Returns
     /// what was opened.
@@ -198,6 +203,19 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// Create a media file and get it ready to receive frames and audio.
     fn create_writer(&self, spec: &WriterSpec) -> anyhow::Result<Self::Writer>;
 
+    /// Finish the file `name` in `folder` that an interrupted recording
+    /// left behind, if it is one a crash-safe writer can complete from its
+    /// fragments. `None`: it isn't one, or it is already a finished movie.
+    /// The caller holds the folder's recording lock; the platform must
+    /// touch only a regular file inside that folder (no links).
+    fn recover_file(
+        &self,
+        _folder: &Path,
+        _name: &std::ffi::OsStr,
+    ) -> anyhow::Result<Option<RecoveredFile>> {
+        Ok(None)
+    }
+
     /// Start capturing `target` (a display, a window or an app's windows)
     /// at up to `fps`, at its native resolution, delivering frames to
     /// `sink`. `ten_bit` asks for 10-bit 4:2:0 frames instead of 8-bit;
@@ -230,11 +248,12 @@ pub trait Platform: Clone + Send + Sync + 'static {
         sink: AudioSink,
     ) -> anyhow::Result<(Self::Capture, u32)>;
 
-    /// Start capturing what the computer plays. Returns its channel count.
-    /// `exclude_own` leaves out what this process plays (monitoring), so it
-    /// isn't recorded twice.
+    /// Start capturing what the computer plays, leaving out the apps
+    /// `exclude` names. Returns its channel count. `exclude_own` leaves out
+    /// what this process plays (monitoring), so it isn't recorded twice.
     fn capture_system_audio(
         &self,
+        exclude: &[String],
         sink: AudioSink,
         exclude_own: bool,
     ) -> anyhow::Result<(Self::Capture, u32)>;
@@ -437,8 +456,11 @@ pub enum MediaPart {
 }
 
 /// Files to join end to end into one (a timeline's export): the video
-/// copied as it is, each audio track decoded and encoded again as one
-/// continuous track, so it lines up with the video at every join.
+/// copied as it is, except the frames from a cut that isn't on a keyframe
+/// to the next keyframe, and parts whose video is in another format than
+/// the joined file's, which are decoded and encoded again; each audio
+/// track decoded and encoded again as one continuous track, cross-faded
+/// at each join, so it lines up with the video at every join.
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
     /// The files, in order. Each has one video track and the same number
@@ -447,6 +469,9 @@ pub struct JoinSpec {
     /// Where the joined file goes; it must not exist.
     pub output: PathBuf,
     pub container: Container,
+    /// The joined video takes this file's codec, size and frame rate (the
+    /// program's, for an edited file); the first part's if absent.
+    pub format: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +487,18 @@ pub struct JoinPart {
     /// Where the file starts within its clip, in seconds (a file that
     /// started after the others): held before it, as at the end.
     pub offset_seconds: f64,
+    /// Where the part starts on its take's clock (its clip's in point), in
+    /// seconds: what the file holds from there on fills the part. The
+    /// picture at the start is the frame on screen at that moment.
+    pub in_seconds: f64,
+    /// Take the part's audio from this file of the same take instead (and
+    /// where it starts within the clip): an edited file shows an ISO
+    /// file's picture with the program's sound.
+    pub audio: Option<(PathBuf, f64)>,
+    /// The file's frame rate as recorded (its manifest's), which a file
+    /// with dropped frames can't tell; 0 if unknown (then the file's own
+    /// average, rounded).
+    pub fps: u32,
 }
 
 /// What a join wrote.
@@ -481,6 +518,11 @@ pub struct JoinedPart {
     pub frames: u64,
     /// Frames starting past the part's length, left out.
     pub frames_left_out: u64,
+    /// Frames decoded and encoded again; the others were copied.
+    pub reencoded: u64,
+    /// Its file is in another format than the joined file's (codec, size
+    /// or frame rate), so it was encoded again whole.
+    pub converted: bool,
 }
 
 /// Called with how far a join has got, 0 to 1, a few times a second;
@@ -641,14 +683,106 @@ pub trait FileWriter: Send {
     /// they were dropped.
     fn append_audio(&mut self, track: usize, samples: &[f32], pts: Time) -> anyhow::Result<bool>;
 
-    /// End the timeline at `end` and finish the file. Returns the number of
-    /// repeated pictures added to cover missing tail frames. They are stored
-    /// frames, but must not reduce the count of dropped original pictures.
-    fn finish(self, end: Time) -> anyhow::Result<u64>;
+    /// End the timeline at `end` and finish the file: how many pictures
+    /// were repeated to cover missing tail frames (stored frames that must
+    /// not reduce the count of dropped original pictures), and what the
+    /// encoders discarded on their own while finishing. A writer that
+    /// repaired its file after failing attaches a [`RepairedFile`] to its
+    /// error.
+    fn finish(self, end: Time) -> anyhow::Result<Finished>;
 
     /// Abandon the file and delete what was written. Used when it never
     /// received a frame.
     fn cancel(self);
+
+    /// Whether this writer can commit what it holds to the disk on demand
+    /// and say how much of the file is recoverable after a crash.
+    fn crash_safe(&self) -> bool {
+        false
+    }
+
+    /// Write everything received so far to the disk and return how much of
+    /// the file's timeline (from its start) a crash can no longer lose.
+    /// `None`: the writer can't say (see [`FileWriter::crash_safe`]).
+    fn commit(&mut self) -> anyhow::Result<Option<std::time::Duration>> {
+        Ok(None)
+    }
+
+    /// How much of the file's timeline the fragments written so far make
+    /// recoverable, without committing anything.
+    fn committed(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Frames the encoder accepted from `append_video` but discarded on
+    /// its own since the last call (a hardware encoder's dropped-frame
+    /// callback), so the file's frame count stays what is in the file.
+    fn lost_frames(&mut self) -> u64 {
+        0
+    }
+}
+
+/// What finishing a file established (see [`FileWriter::finish`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Finished {
+    /// Pictures repeated at the end to cover missing tail frames.
+    pub repeated: u64,
+    /// Pictures the encoder accepted and then discarded, discovered while
+    /// finishing (after the last `lost_frames` poll).
+    pub lost_frames: u64,
+    /// Audio tracks whose encoder delivered fewer packets than its input
+    /// covered (each counts as one dropout).
+    pub lost_audio_tracks: u64,
+}
+
+/// What a file holds after its writer failed and still finished it from
+/// what had reached the disk; attached as context to the writer's error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairedFile {
+    /// Fragments the movie was rebuilt from.
+    pub fragments: u32,
+    /// Pictures in the movie, if it was rebuilt from fragments (a crash
+    /// between the final index and its header patch keeps every picture
+    /// the writer counted).
+    pub frames: Option<u64>,
+    /// The shortest kept track's duration.
+    pub seconds: Option<f64>,
+    /// What the movie holds, track by track ("video 16 pictures (0.533 s);
+    /// audio 0.319 s; left out: …"), empty when only the header patch was
+    /// missing.
+    pub summary: String,
+}
+
+impl std::fmt::Display for RepairedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the file was still finished from its {} fragments",
+            self.fragments
+        )?;
+        if !self.summary.is_empty() {
+            write!(f, " ({})", self.summary)?;
+        }
+        Ok(())
+    }
+}
+
+/// An interrupted file a platform finished from what reached the disk
+/// (see [`Platform::recover_file`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredFile {
+    /// Fragments the file was rebuilt from; 0 when only its final header
+    /// patch was missing.
+    pub fragments: u32,
+    /// Pictures in the rebuilt movie (unknown when only the header patch
+    /// was missing: the writer's own counts stand).
+    pub frames: Option<u64>,
+    /// The shortest kept track's recovered duration, if the file was rebuilt.
+    pub seconds: Option<f64>,
+    /// What the movie holds, track by track, including what was left out
+    /// (a track without any sample); empty when only the header patch was
+    /// missing.
+    pub summary: String,
 }
 
 /// A volume files are written to.
@@ -669,6 +803,9 @@ pub struct WriterSpec {
     pub container: Container,
     pub video: VideoTrackSpec,
     pub audio: Vec<AudioTrackSpec>,
+    /// When the take began (wall clock): the file's creation time, the same
+    /// for every file of a take.
+    pub created: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone)]

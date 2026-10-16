@@ -28,6 +28,9 @@ use crate::timeline::{
     TimelineMoveParams, TimelineNewParams, TimelineOpenParams, TimelineRemoveParams,
     TimelineSummary, TimelineTarget,
 };
+use crate::timeline::{
+    TimelineAngleParams, TimelineRangeParams, TimelineSplitParams, TimelineTrimParams,
+};
 use crate::{Canvas, Issue, Setup};
 
 /// Every method the engine offers. Serialized as JSON-RPC `method` and
@@ -168,27 +171,45 @@ pub enum Method {
     Permissions,
     /// Ask macOS for screen recording, camera and microphone access where
     /// it hasn't been decided (its prompts appear on screen) and wait up to
-    /// a minute for the answers. Returns
-    /// [`PermissionsReport`](crate::devices::PermissionsReport).
-    RequestPermissions,
+    /// a minute for the answers; with `permission`, only for that one.
+    /// Returns [`PermissionsReport`](crate::devices::PermissionsReport).
+    /// Its params are optional: `{"method": "request_permissions"}` asks
+    /// for all three.
+    RequestPermissions(Option<RequestPermissionsParams>),
     /// Open the System Settings pane where a permission is turned on by
     /// hand. Returns [`Opened`].
     OpenPermissionSettings {
         permission: crate::devices::PermissionKind,
     },
     /// Start streaming the program (the canvas and the program mix) to the
-    /// live setup's `[stream]` service, starting the live engine if needed.
-    /// Recordings start and stop independently of it. Returns
-    /// [`StreamStatus`] once live, or an error saying what to do.
-    StreamStart,
-    /// Stop streaming. Returns the stream's final [`StreamStatus`].
-    StreamStop,
+    /// live setup's `[stream]` destinations (every enabled one, or those in
+    /// `only`), starting the live engine if needed. Destinations already
+    /// streaming are left alone. Recordings start and stop independently
+    /// of it. Returns [`Streaming`] once each has gone live or failed, or
+    /// an error saying what to do when none could start. Its params are
+    /// optional: `{"method": "stream_start"}` starts every enabled one.
+    StreamStart(Option<StreamStartParams>),
+    /// Stop streaming (to every destination, or those in `only`); the
+    /// others keep going. Returns their final [`Streaming`] status. Its
+    /// params are optional.
+    StreamStop(Option<StreamStartParams>),
     /// Keep a stream key in the Keychain for the live setup's service (or
     /// the one given). It is never logged, shown or returned. Returns
     /// [`StreamKey`].
     StreamKeySet(Box<StreamKeyParams>),
     /// Remove a stored stream key. Returns [`StreamKey`].
     StreamKeyClear(Box<StreamKeyTarget>),
+    /// Add a stream destination to the live setup (making its `[stream]`
+    /// section, as the main destination, if it has none). Returns
+    /// [`StreamDestinations`].
+    StreamDestinationAdd(Box<StreamDestinationParams>),
+    /// Remove a stream destination from the live setup (not `main`: turn it
+    /// off instead, or remove the whole `[stream]`). Returns
+    /// [`StreamDestinations`].
+    StreamDestinationRemove { id: String },
+    /// Change a stream destination (`id` required; `main` changes the
+    /// `[stream]` section itself). Returns [`StreamDestinations`].
+    StreamDestinationSet(Box<StreamDestinationParams>),
     /// The scene collections and profiles (the two parts the live setup is
     /// kept in, as in OBS) and which are current. Returns
     /// [`Library`](crate::library::Library).
@@ -292,7 +313,11 @@ pub enum Method {
     Retake(Option<RetakeParams>),
     /// Join a timeline's clips (the current one's unless `timeline` names
     /// one), in order, into one program file and one file per ISO source
-    /// every clip has, without re-encoding the video, plus a manifest. It
+    /// every clip has, each cut to the clips' in and out points, plus the
+    /// edited file when clips show other angles, and a manifest. The video
+    /// is copied as recorded except the frames around a cut that doesn't
+    /// fall on a keyframe (and parts of the edited file in another format),
+    /// which are encoded again; audio is cross-faded at every join. It
     /// runs in the background: `export_progress` and `export_finished`
     /// events report it. Its params are optional. Returns
     /// [`ExportStarted`](crate::timeline::ExportStarted).
@@ -314,6 +339,13 @@ pub enum Method {
     VirtualCameraStop,
     /// Camera state, output format, counters and any failure.
     VirtualCameraStatus,
+    /// Remove Isocast Virtual Camera from macOS (deactivate the release
+    /// app's camera extension) so Isocast can be deleted cleanly: stops the
+    /// camera first; macOS asks for an administrator password, and the call
+    /// waits for it (up to about 4 minutes). Returns
+    /// [`crate::virtual_camera::VirtualCameraRemoval`]. Refused by a
+    /// development engine (scripts/vcam-uninstall.sh removes its camera).
+    VirtualCameraRemove,
     /// Stop recording if needed, then exit the daemon.
     Shutdown,
     /// Recording codec labels and supported containers; returns EncoderOption[].
@@ -346,6 +378,94 @@ pub enum Method {
     /// writes into it. Manifests and timelines keep resolving. Returns
     /// [`ProjectRenamed`](crate::project::ProjectRenamed).
     RenameProject(crate::project::RenameProjectParams),
+    /// Predict, without benchmarking, whether a setup's files (the live
+    /// setup's, at its sources' live formats, if none is given) fit this
+    /// Mac's media engines, from measured per-chip data (and what `tune`
+    /// measured here, if it did), with the closest changes that fit. With
+    /// `add_iso`, how to turn on that source's ISO file so it fits. Allowed
+    /// while recording. Returns [`CapacityEstimate`].
+    EstimateCapacity(Box<CapacityParams>),
+    /// Look for OBS Studio's scene collections and profiles on this Mac
+    /// (its settings folder, or `folder`), without importing anything:
+    /// each collection with its scene and source counts and the profile an
+    /// import would take its settings from, each profile's video,
+    /// recording and stream settings (never a stream key; `key_in_file`
+    /// says whether OBS keeps one in plain text), and files that couldn't
+    /// be read. Its params are optional. Returns
+    /// [`Discovery`](crate::obs::Discovery).
+    ObsDiscover(Option<crate::optimize::ObsDiscoverParams>),
+    /// Measure the upload speed to a streaming service's ingest with a
+    /// short publish of filler data (Twitch's bandwidth test mode, or a
+    /// custom server, which shows it if it relays to a live service), and
+    /// recommend a stream bitrate. Services that would
+    /// put a test on air (YouTube, Facebook, Kick), or a missing stream
+    /// key, give a documented fallback instead (`measured` false, with
+    /// the reason). Returns [`SpeedTest`](crate::optimize::SpeedTest).
+    SpeedTest(Box<crate::optimize::SpeedTestParams>),
+    /// Optimize the live setup for recording, streaming or both (OBS's
+    /// Auto-Configuration Wizard): favour quality and ISO files for
+    /// recording; for streaming, set the service and a bitrate from the
+    /// upload speed (measured if not given); then benchmark this Mac
+    /// (`tune`) and step down where it can't keep up. A custom server is
+    /// tested only through `speed_test`, never implicitly. Applies it if
+    /// asked (refused if the setup changed meanwhile).
+    /// Refused while recording. Returns
+    /// [`Optimized`](crate::optimize::Optimized), with a one-line summary.
+    Optimize(Box<crate::optimize::OptimizeParams>),
+    /// Start the replay buffer: keep the last `recording.replay.seconds`
+    /// of the encoded program (video and the program mix) in memory, apart
+    /// from any recording or stream. Shares the stream's encoder when one
+    /// runs with the same format. Returns
+    /// [`ReplayStatus`](crate::replay::ReplayStatus).
+    ReplayStart,
+    /// Stop the replay buffer, discarding what it holds. Returns its final
+    /// [`ReplayStatus`](crate::replay::ReplayStatus).
+    ReplayStop,
+    /// Save what the replay buffer holds, up to this moment, to a new file
+    /// in the recordings folder (the running recording's project folder,
+    /// if one records). Never interrupts a recording or stream. Returns
+    /// [`ReplaySaved`](crate::replay::ReplaySaved).
+    ReplaySave,
+    /// The replay buffer's state, memory and counters. Returns
+    /// [`ReplayStatus`](crate::replay::ReplayStatus).
+    ReplayStatus,
+    /// The obs-websocket v5 compatibility server: whether it is on and
+    /// listening, where, whether it asks for a password, and how many
+    /// clients are connected. Returns
+    /// [`WebsocketStatus`](crate::websocket::WebsocketStatus).
+    WebsocketStatus,
+    /// Turn on the obs-websocket v5 server (OBS tools such as Stream Deck
+    /// and Touch Portal then drive Isocast), optionally changing its port,
+    /// address or password. Without a stored password one is generated
+    /// and returned once. Kept across restarts. Returns
+    /// [`WebsocketStatus`](crate::websocket::WebsocketStatus).
+    WebsocketEnable(Option<crate::websocket::WebsocketEnableParams>),
+    /// Turn off the obs-websocket server, disconnecting its clients.
+    /// Returns [`WebsocketStatus`](crate::websocket::WebsocketStatus).
+    WebsocketDisable,
+    /// Move a clip's in and/or out point, on its take's clock (rounded to
+    /// its frame grid); the take's files are never touched. One revision.
+    /// Returns [`TimelineInfo`](crate::timeline::TimelineInfo).
+    TimelineTrim(TimelineTrimParams),
+    /// Cut the clip at a moment on the timeline in two (the second gets a
+    /// new id, and the first's angle). One revision. Returns
+    /// [`TimelineInfo`](crate::timeline::TimelineInfo).
+    TimelineSplit(TimelineSplitParams),
+    /// Take a span of the timeline out, closing the gap (ripple): clips in
+    /// it are taken off, clips across its ends trimmed or split. One
+    /// revision. Returns [`TimelineInfo`](crate::timeline::TimelineInfo).
+    TimelineDeleteRange(TimelineRangeParams),
+    /// Choose the source the edited video shows over a span of the
+    /// timeline (`program` or an ISO source): clips across its ends are
+    /// split there and every clip in it shows `source`. One revision.
+    /// Returns [`TimelineInfo`](crate::timeline::TimelineInfo).
+    TimelineAngle(TimelineAngleParams),
+    /// Take back the last edit (trim, split, delete, angle, remove, move).
+    /// Returns [`TimelineInfo`](crate::timeline::TimelineInfo).
+    TimelineUndo(Option<TimelineTarget>),
+    /// Put back the last edit undone. Returns
+    /// [`TimelineInfo`](crate::timeline::TimelineInfo).
+    TimelineRedo(Option<TimelineTarget>),
 }
 
 /// Every method's name, as requests and plugin grants spell it
@@ -395,15 +515,86 @@ impl std::fmt::Debug for StreamKeyParams {
 }
 
 /// Which stream key: the live setup's `[stream]` service (and server, for
-/// `custom`) unless given.
+/// `custom`) unless given, or a destination's.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StreamKeyTarget {
+    /// A destination (`main` or an id in `stream.destinations`): its own
+    /// key. Alone, the live setup's destination of that id; with
+    /// `service` (and `server` for custom), one not applied yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<StreamService>,
     /// For `custom`, the server the key belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+}
+
+/// Which stream destinations `stream_start` and `stream_stop` mean.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamStartParams {
+    /// Destination ids (`main` and the ids in `stream.destinations`); every
+    /// enabled one (or for a stop, every one streaming) if empty. A
+    /// destination named here starts even if it is turned off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only: Vec<String>,
+}
+
+/// What `stream_start` and `stream_stop` did: the first destination they
+/// touched (the main one if it was), flattened so a single-destination
+/// client reads it as before, and every destination's status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Streaming {
+    #[serde(flatten)]
+    pub stream: StreamStatus,
+    /// Every destination of the live setup, the main one first.
+    #[serde(default)]
+    pub destinations: Vec<StreamStatus>,
+}
+
+/// A stream destination to add or change. Absent fields are left as they
+/// are (for `add`: the main destination's, or the service's defaults).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDestinationParams {
+    /// The destination's id. For `add`, made from the service if absent
+    /// (`youtube`, `youtube-2`); required for `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Required for `add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<StreamService>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_bitrate_kbps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Fields to reset: `server` (to the service's), `video_bitrate_kbps`
+    /// and `size` (to the main destination's; for `main`, the defaults).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear: Vec<String>,
+}
+
+/// The fields `StreamDestinationParams::clear` takes.
+pub const DESTINATION_CLEARABLE: [&str; 3] = ["server", "video_bitrate_kbps", "size"];
+
+/// The live setup's stream destinations after a change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StreamDestinations {
+    /// The new live revision.
+    pub revision: u64,
+    /// The destination added or changed (absent after a removal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Every destination, the main one first.
+    pub destinations: Vec<StreamStatus>,
 }
 
 /// Where a stream key is kept, and whether one is.
@@ -555,6 +746,16 @@ pub struct GetParams {
     /// Also return where every item is drawn, as laid out (`resolved`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resolved: bool,
+}
+
+/// What `request_permissions` asks for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestPermissionsParams {
+    /// Only this permission (screen_recording, camera, microphone or
+    /// system_audio); all that haven't been decided if left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<crate::devices::PermissionKind>,
 }
 
 /// Parameters of `watch`: which kinds of events (their `type`) to send.
@@ -976,6 +1177,14 @@ pub enum Event {
         id: String,
         name: String,
     },
+    /// The replay buffer started, stopped or failed.
+    Replay { replay: crate::replay::ReplayStatus },
+    /// The replay buffer saved a file.
+    ReplaySaved { saved: crate::replay::ReplaySaved },
+    /// The hardware encoders can't keep up: files of the take are dropping
+    /// frames (ISO files first; the program and stream are protected), and
+    /// the disk isn't the cause. Comes at most once per take.
+    EncoderOverload { overload: Box<Overload> },
 }
 
 /// What began a take, in `started` events.
@@ -1035,11 +1244,14 @@ pub enum EventKind {
     ProjectCreated,
     ProjectRenamed,
     DeviceChanged,
+    Replay,
+    ReplaySaved,
+    EncoderOverload,
 }
 
 impl EventKind {
     /// Every kind's name, as events and `watch` spell it, in this order.
-    pub const NAMES: [&str; 26] = [
+    pub const NAMES: [&str; 29] = [
         "setup_changed",
         "started",
         "status",
@@ -1066,6 +1278,9 @@ impl EventKind {
         "project_created",
         "project_renamed",
         "device_changed",
+        "replay",
+        "replay_saved",
+        "encoder_overload",
     ];
 
     /// The kind's name, as events and `watch` spell it.
@@ -1103,6 +1318,9 @@ impl Event {
             Self::ProjectCreated { .. } => EventKind::ProjectCreated,
             Self::ProjectRenamed { .. } => EventKind::ProjectRenamed,
             Self::DeviceChanged { .. } => EventKind::DeviceChanged,
+            Self::Replay { .. } => EventKind::Replay,
+            Self::ReplaySaved { .. } => EventKind::ReplaySaved,
+            Self::EncoderOverload { .. } => EventKind::EncoderOverload,
         }
     }
 }
@@ -1174,9 +1392,14 @@ pub struct Status {
     pub collection: Option<Current>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Current>,
-    /// The stream, if the live setup streams or a stream is running.
+    /// The stream, if the live setup streams or a stream is running: the
+    /// main destination's (see `streams` for every destination).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<StreamStatus>,
+    /// Every stream destination, the main one first (empty without a
+    /// `[stream]` section or a running stream).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<StreamStatus>,
     /// How much of this Mac's processor isocastd used lately, in percent
     /// of all its cores (as OBS's status bar shows it): measured between
     /// readings at least a second apart.
@@ -1203,6 +1426,9 @@ pub struct Status {
     /// Camera output state (installation is explicit, never automatic).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_camera: Option<crate::virtual_camera::VirtualCameraStatus>,
+    /// The replay buffer: running or not, what it holds, its last save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<crate::replay::ReplayStatus>,
     /// Free space on the disk the live setup records to (its
     /// `recording.folder`, or the nearest folder above it that exists;
     /// with no setup yet, `~/Movies/Isocast`'s, where a new one records),
@@ -1242,6 +1468,21 @@ pub enum EngineState {
     Recording,
 }
 
+/// The engine's executable inside a release app's
+/// `Contents/Helpers/Isocast Engine.app/Contents/MacOS/` (#83): macOS names
+/// it in prompts such as the camera extension's approval alert. Cargo,
+/// development builds and the development app still call it `isocastd`.
+pub const ENGINE_EXECUTABLE: &str = "Isocast Engine";
+
+/// What the engine's executable was called in release apps before #83,
+/// and is still called in development builds.
+pub const OLD_ENGINE_EXECUTABLE: &str = "isocastd";
+
+/// Whether `name` is an engine executable's file name, either one.
+pub fn is_engine_executable(name: &std::ffi::OsStr) -> bool {
+    name == ENGINE_EXECUTABLE || name == OLD_ENGINE_EXECUTABLE
+}
+
 /// Where the daemon listens: `$ISOCAST_SOCKET`, or else
 /// `~/Library/Application Support/Isocast/isocastd.sock` on macOS and
 /// `~/.isocast/isocastd.sock` elsewhere.
@@ -1249,6 +1490,11 @@ pub fn socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("ISOCAST_SOCKET") {
         return PathBuf::from(path);
     }
+    default_socket_path()
+}
+
+/// The user's own engine's socket, whatever `$ISOCAST_SOCKET` says.
+pub fn default_socket_path() -> PathBuf {
     support_folder().join("isocastd.sock")
 }
 
@@ -2060,6 +2306,18 @@ pub struct RecordingPause {
     pub paused: bool,
     pub elapsed_seconds: f64,
     pub paused_seconds: f64,
+    /// A pause reply of crash-safe files: seconds of the take's saved
+    /// timeline up to which every file was written and flushed to the
+    /// disk before this reply (the same number the manifest's pause entry
+    /// records). Absent when the files can't say (AVAssetWriter), when a
+    /// file's commit failed or timed out (see `errors`), and on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recoverable_seconds: Option<f64>,
+    /// What went wrong committing the files at this pause: the pause
+    /// itself took effect, but nothing durable is promised for the files
+    /// named here, and they are reported failed when the recording ends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 /// How the disk holding a running session's files keeps up.
@@ -2152,6 +2410,11 @@ pub struct LiveFile {
     /// recording; the final report has the exact count.
     pub dropped_frames: u64,
     pub audio_dropouts: u64,
+    /// Seconds of the file, from its start, that a crash can no longer
+    /// lose: every track's samples up to there are in completed fragments
+    /// on disk. Only crash-safe writers report it (absent otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -2405,6 +2668,175 @@ pub struct Variant {
     pub feasible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityParams {
+    /// The setup to judge; the live setup, at its sources' live formats,
+    /// if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<Setup>,
+    /// Count the stream's encode too. If absent: for the live setup,
+    /// whether it streams now; for a given setup, whether it has a stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// A source id whose ISO file would be turned on: `admission` says how
+    /// to add it so the setup still fits (at a smaller size or frame rate,
+    /// or not at all), and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_iso: Option<String>,
+}
+
+/// Whether a setup's files fit this Mac's media engines, predicted from
+/// per-chip data without benchmarking (`tune` measures).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacityEstimate {
+    /// This Mac's chip, as macOS names it.
+    pub chip: String,
+    /// H.264/HEVC encode engines on the chip. Each file's encoder runs on
+    /// one of them for its whole life (ProRes has engines of its own).
+    pub encode_engines: u32,
+    /// Pixels a second one engine encodes in real time (8-bit HEVC at
+    /// Isocast's settings) before files drop frames.
+    pub engine_pixels_per_second: f64,
+    /// Where those numbers come from: which Mac they were measured on, or
+    /// that they are assumed from the chip's family.
+    pub basis: String,
+    /// The video encodes the setup asks for.
+    pub outputs: Vec<EstimatedOutput>,
+    /// The busiest engine's work over what it manages in real time: up to
+    /// 0.85 fits, up to 1 keeps up with no margin, over 1 drops frames.
+    pub load: f64,
+    pub capacity: Capacity,
+    /// Whether the stream's encode is counted.
+    pub streaming: bool,
+    /// At least this share of ISO pictures can't be encoded, in percent
+    /// (the program and stream are served first; 0 when it keeps up).
+    pub iso_drop_percent: f64,
+    /// The verdict in words.
+    pub summary: String,
+    /// When it doesn't fit (or has no margin): the closest changes that
+    /// fit, closest first; or, if none does, those that come closest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<CapacitySuggestion>,
+    /// With `add_iso`: how to turn that ISO file on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<IsoAdmission>,
+    /// What `tune` measured for these files on this Mac, if it did; a
+    /// measured "can't keep up" overrules the prediction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<String>,
+    /// The same for setups that ask the same of the encoders (the files'
+    /// sizes, rates and codecs, and the stream): what a client remembers
+    /// for "don't show again for this setup".
+    pub workload_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputKind {
+    Program,
+    Stream,
+    Iso,
+}
+
+/// One video encode of a setup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EstimatedOutput {
+    /// `program`, `stream`, or the ISO file's source id.
+    pub output: String,
+    pub kind: OutputKind,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub codec: crate::Codec,
+    /// Kept whole under overload (the program and the stream); ISO files
+    /// drop pictures first.
+    pub protected: bool,
+    /// Its work on the H.264/HEVC engines, in HEVC-equivalent pixels a
+    /// second; 0 for ProRes, which has engines of its own.
+    pub pixels_per_second: f64,
+    /// The size or rate wasn't known (the source isn't running), so the
+    /// canvas's was assumed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assumed: bool,
+}
+
+/// A change that makes a setup ask less of the encoders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacitySuggestion {
+    /// What it changes, like "capture facecam at 1280×720".
+    pub description: String,
+    /// A patch for `plan`/`apply` that makes it, if it's a setup change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<serde_json::Value>,
+    /// A method that makes it instead, like `stream_stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The load with it (see [`CapacityEstimate::load`]).
+    pub load: f64,
+    pub capacity: Capacity,
+    /// Applying it now would change a running recording's sources or
+    /// canvas, so apply it once the take ends (a setup change applied
+    /// while recording takes effect from the next take anyway).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_take: bool,
+}
+
+/// How to turn on a source's ISO file so the setup still fits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct IsoAdmission {
+    pub source: String,
+    /// Whether the ISO file goes on at all.
+    pub on: bool,
+    /// Whether it goes on as the source is (no smaller size or rate).
+    pub as_is: bool,
+    /// A patch for `plan`/`apply`: turns the ISO file on (maybe with the
+    /// source at a smaller size or rate), or nothing if it stays off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<serde_json::Value>,
+    /// What it does, like "facecam's ISO file at 1280×720, 30 fps".
+    pub description: String,
+    /// The ISO file's size and rate when it goes on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// Why it isn't added as it is, if it isn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Files dropping frames because the encoders are at capacity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Overload {
+    pub take: u32,
+    /// Seconds into the take when it was noticed.
+    pub elapsed_seconds: f64,
+    /// The files dropping frames so far, worst first.
+    pub dropping: Vec<OverloadedFile>,
+    /// Whether the program or stream drops too, not just ISO files.
+    pub protected_dropping: bool,
+    /// Why, in words.
+    pub reason: String,
+    /// The live setup's estimate, with the fixes: apply a suggestion's
+    /// `change` with `plan`/`apply` (once the take ends if `after_take`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<CapacityEstimate>,
+    /// See [`CapacityEstimate::workload_key`].
+    pub workload_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OverloadedFile {
+    /// `program`, `stream` or the ISO file's source id.
+    pub output: String,
+    pub dropped_frames: u64,
+    /// Of the pictures due so far.
+    pub percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

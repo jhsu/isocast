@@ -16,11 +16,32 @@ export struct ServiceChoice {
     hint: string,
 }
 
+// A stream destination (Stream → Destinations, #73): its id, what to call
+// it ("YouTube", "backup"), a few words on its state ("Live", "Key saved",
+// "No key yet", "Own encoder") and whether `stream start` streams to it.
+export struct DestinationRow {
+    id: string,
+    label: string,
+    status: string,
+    enabled: bool,
+}
+
 // A video source the ISO files can record (Output → ISO Recording).
+// An audio source an ISO file can carry, and whether it does.
+export struct IsoTrack {
+    id: string,
+    name: string,
+    on: bool,
+}
+
 export struct IsoChoice {
     id: string,
     name: string,
     on: bool,
+    // Its file's audio: the other ISO files' choice (no list of its own),
+    // and each audio source, checked when the file carries it.
+    shared-audio: bool,
+    tracks: [IsoTrack],
 }
 
 // An Audio Input Capture source and its device (Audio → Audio Devices).
@@ -65,23 +86,6 @@ export struct BindingGroup {
 export struct ReportFileRow {
     name: string,
     size: string,
-}
-
-// First run: a permission and where it stands.
-export struct PermissionRow {
-    id: string,
-    icon: string,
-    title: string,
-    hint: string,
-    // What to do, if it isn't allowed ("" when nothing).
-    todo: string,
-    // The engine restarts to pick it up (a link after `todo`).
-    restart: bool,
-    state: string,
-    granted: bool,
-    denied: bool,
-    // "Open Settings" is the way to allow it.
-    open-settings: bool,
 }
 
 // First run: one choice of a device column.
@@ -187,6 +191,24 @@ export global SettingsArea {
     callback server-back();
     callback save-key(string);
     callback clear-key();
+    // The destinations, the main one ([stream] itself) first; the one
+    // `destination` names is open below its row, and the Service, Server
+    // and Stream Key rows above are its. Adding one shows the services.
+    in-out property <[DestinationRow]> destinations;
+    in-out property <string> destination: "main";
+    in-out property <bool> adding-destination;
+    // The open destination streams now (it can't be removed).
+    in-out property <bool> destination-live;
+    // An added destination's own bitrate and size (else the main one's).
+    in-out property <bool> destination-own-bitrate;
+    in-out property <float> destination-bitrate;
+    in-out property <bool> destination-own-size;
+    in-out property <float> destination-width;
+    in-out property <float> destination-height;
+    callback select-destination(string);
+    callback add-destination();
+    callback remove-destination();
+    callback set-destination-enabled(string, bool);
 
     // ---- Output
     in-out property <string> folder;
@@ -207,6 +229,9 @@ export global SettingsArea {
     in-out property <float> program-quality;
     in-out property <float> iso-quality;
     in-out property <float> keep-free;
+    // The replay buffer's length (s) and memory limit (MB).
+    in-out property <float> replay-seconds: 30;
+    in-out property <float> replay-memory: 1024;
     in-out property <bool> program-on;
     in-out property <string> program-codec;
     in-out property <string> program-container;
@@ -223,6 +248,8 @@ export global SettingsArea {
     callback browse-folder();
     callback choose-quality(int);
     callback set-iso-source(string, bool);
+    // An ISO file's audio (source, audio source or "default").
+    callback set-iso-audio(string, string);
 
     // ---- Audio
     in-out property <[MicRow]> mics;
@@ -291,6 +318,8 @@ export global SettingsArea {
     // Developer mode (the profile's `developer`).
     in-out property <bool> developer-on;
     in-out property <bool> developer-auto-off;
+    // "Turn Off After 24 Hours", or the profile's own hours.
+    in-out property <string> developer-auto-off-label: "Turn Off After 24 Hours";
 
     // ---- Welcome (no setup yet) and the failed state
     // Which choice is working ("obs", "file"; "" for none).
@@ -305,11 +334,6 @@ export global SettingsArea {
     // A live setup exists: the first run can be closed.
     in-out property <bool> can-close;
     in-out property <bool> creating;
-    // Permissions: read at least once, and asking now.
-    in-out property <bool> checked;
-    in-out property <bool> asking;
-    in-out property <bool> any-to-ask;
-    in-out property <[PermissionRow]> permissions;
     // Devices: listed at least once.
     in-out property <bool> devices-listed;
     in-out property <[DeviceChoice]> displays;
@@ -330,10 +354,6 @@ export global SettingsArea {
     callback ob-back();
     callback ob-next();
     callback ob-create();
-    callback ob-ask();
-    callback ob-check();
-    callback ob-restart-engine();
-    callback ob-open-settings(string);
     // A choice: the field ("display", "camera", "microphone",
     // "system_audio", "layout", "canvas", "fps", "folder", "name") and
     // its value.

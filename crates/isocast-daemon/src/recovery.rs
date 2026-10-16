@@ -65,11 +65,13 @@ impl Daemon {
                     s.stop.store(true, Ordering::SeqCst);
                     s.id
                 });
-                (id, state.stream.take(), state.engine.clone())
+                (id, std::mem::take(&mut state.streams), state.engine.clone())
             };
-            // Stop the stream as well, while its sources still run.
-            if let Some(stream) = stream {
-                let _ = isocast_diagnostics::contain("emergency stream stop", || stream.stop());
+            // Stop the streams as well, while their sources still run.
+            for (_, output) in stream {
+                if let crate::streams::Output::Running(stream) = output {
+                    let _ = isocast_diagnostics::contain("emergency stream stop", || stream.stop());
+                }
             }
             let deadline = Instant::now() + Duration::from_secs(9);
             let report = loop {
@@ -111,25 +113,18 @@ impl Daemon {
     /// The recordings folders recordings were made in lately (newest
     /// last), as `remember_recording_folder` keeps them.
     pub(crate) fn remembered_recording_folders(&self) -> Vec<PathBuf> {
-        let path = isocast_protocol::api::setup_path().with_extension("recording-folders.json");
-        std::fs::read(path)
-            .ok()
-            .and_then(|s| serde_json::from_slice::<Vec<PathBuf>>(&s).ok())
-            .unwrap_or_default()
+        isocast_protocol::project::remembered_roots()
     }
 
+    /// Remember a recordings folder (a failure is logged: the folder's
+    /// projects are then listed only while it is the setup's).
     pub(crate) fn remember_recording_folder(&self, folder: &std::path::Path) {
-        let path = isocast_protocol::api::setup_path().with_extension("recording-folders.json");
-        let mut folders = std::fs::read(&path)
-            .ok()
-            .and_then(|s| serde_json::from_slice::<Vec<PathBuf>>(&s).ok())
-            .unwrap_or_default();
-        folders.retain(|p| p != folder);
-        folders.push(folder.to_owned());
-        if folders.len() > 20 {
-            folders.drain(..folders.len() - 20);
+        if let Err(err) = isocast_protocol::project::remember_root(folder) {
+            isocast_diagnostics::diagnostic!("warn";
+                "isocastd: could not remember the recordings folder {}: {err}",
+                folder.display()
+            );
         }
-        let _ = std::fs::write(path, serde_json::to_vec(&folders).unwrap_or_default());
     }
 
     pub(crate) fn recover_recordings(&self) {
@@ -151,11 +146,24 @@ impl Daemon {
         recovered.sort_by(|a, b| b.recording.started_at.cmp(&a.recording.started_at));
         recovered.truncate(20);
         for take in recovered.iter().filter(|r| r.newly_detected) {
+            // Files a crash-safe writer left were finished from their
+            // fragments just now; the manifest's errors say what each holds.
+            let finished = take.recording.errors.iter().any(|e| {
+                e.contains("crash-safe fragments that reached the disk")
+                    || e.contains("completed at launch")
+            });
             self.publish(Event::Warning {
-                message: format!(
-                    "recording interrupted: {}; recoverable duration unknown; inspect status.interrupted or bug_report",
-                    take.manifest.display(),
-                ),
+                message: if finished {
+                    format!(
+                        "recording interrupted: {}; its files were finished from what reached the disk (see the manifest's errors and status.interrupted)",
+                        take.manifest.display(),
+                    )
+                } else {
+                    format!(
+                        "recording interrupted: {}; recoverable duration unknown; inspect status.interrupted or bug_report",
+                        take.manifest.display(),
+                    )
+                },
             });
         }
         *self.interrupted_unnoted.lock().unwrap() = recovered

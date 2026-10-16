@@ -5,6 +5,40 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-16 (S.2 stress): **hw-batch runs one job per test Mac, not one
+  job at a time.** A job with `--mac m2-a|m2-b` (and a soak's receiver)
+  holds `/Volumes/IsocastBuild/.bench.lock.<mac>`; `--mac any` holds
+  `.bench.lock` while it builds and picks, then the Mac's lock. So `now
+  … --mac m2-b` runs while a soak holds m2-a. Each job exports its source
+  to `hw-queue/src/<job>/hw-batch`. Runners started before this (an old
+  `run-queue` process) still take only `.bench.lock`, so they don't see a
+  pinned job's Mac lock: don't pin new jobs to a Mac an old runner may
+  pick until it exits. That includes a soak's `--receiver`: the stress
+  lane's m2-b runs (02:40-03:35 New York) overlapped the main soak's
+  receiver ffmpeg on m2-b; the soak's stream kept 0 drops, 0 reconnects.
+- 2026-10-16 (S.2 stress): the shared test VM's VideoToolbox was wedged
+  (every hevc/h264/ProRes session failed with -12903 / -12900 after 3.6
+  days up, with another lane's engine running): e2e's encoder probe hangs
+  30 s and recordings fail. `scripts/vm.sh` can't fix it; a VM restart
+  would (not done: another lane was using it).
+
+- 2026-10-15: Lane speed (audit /Volumes/IsocastBuild/agent-audit/REPORT.md).
+  exonbook builds: `scripts/remote-build.sh` keeps one source + target per
+  lane in `~/isocast-builds/<lane>` there (nice 15, lane lock, refuses
+  below 40 GB free; `status`, `prune`); never touches `~/dev/isocast` or
+  the dev engine there. Binaries it fetches are minos 11.0 / sdk 27.0,
+  ad-hoc linker-signed like local ones; `testmac.sh push` and e2e/bench
+  sign their own dev apps. Nightly hardware queue:
+  `/Volumes/IsocastBuild/hw-queue/` (`scripts/hw-batch.py`), cronctl job
+  `isocast-hw-nightly` 01:30 New York, registered paused until merged; on
+  the M2s it uses `~/dev/isocast-worktrees/hw-batch` and
+  `~/isocast-scratch/hw-batch/<job>`. Test VM: lume can report
+  `isocast-vm` "stopped" while an older `lume run` still runs it
+  (`lume run` then fails with "Failed to lock auxiliary storage"); vm.sh
+  falls back to the DHCP lease (192.168.64.5). The VM has Homebrew ffmpeg
+  since 2026-10-15 (not in `isocast-vm-clean`; `vm.sh e2e` reinstalls it).
+  Strict e2e drops frames in `projects` in the VM; use `--hosted`.
+
 - 2026-10-13: OBS Studio on the test Macs (for S.1): isocast-m2-a has
   32.2.2 in /Applications from the Homebrew cask `obs`; exonbook keeps
   Ryan's own 32.0.4 in /Applications (with his profiles, NDI and other
@@ -67,6 +101,22 @@ each section. Delete entries that stop being true.
   instances doesn't stop the bill; release with `aws ec2 terminate-instances`
   then `aws ec2 release-hosts --host-ids …` (ask Ryan first). The public IPs
   change if an instance is stopped; update ~/.ssh/config then.
+- 2026-10-15: The two M2s can't reach each other (m2-a -> m2-b:22 times
+  out: the security group admits ssh only from Ryan's IP). `hw-batch.py
+  soak --receiver m2-b` relays through the runner (ssh -R on m2-a to m2-b's
+  sshd, a per-job `restrict,port-forwarding` key on m2-b, removed after);
+  ~150 Mb/s, so a 6 Mb/s stream is fine, but it needs Ryan's Mac and home
+  connection up. The hardware soak (`soak.py --profile hardware`) fails on
+  ISO drops while #41 stands (~40% on both ISOs with the stream on, from
+  the first seconds; program and stream 0).
+- 2026-10-15: The M2s are build hosts too: `scripts/remote-build.sh`
+  picks exonbook, isocast-m2-a or isocast-m2-b (auto, sticky per lane,
+  never a Mac a hardware job holds; docs/handoff/README.md section 7).
+  Lanes live in ~/isocast-builds there as on exonbook; same Rust 1.99 and
+  SDK 27.0, so binaries are interchangeable (m2-b's passed e2e record/iso
+  strict on m2-a, run on exonbook and Ryan's Mac). The M2s idle at load
+  2-3 (WirelessRadioManagerd ~100% CPU) and their clocks are UTC.
+  exonbook peaked at load 80 from other lanes' builds that evening.
 - 2026-10-12: The test-Mac bridge must be a ProcessType Interactive launch
   agent (Astra found it): with launchd's default policy its jobs' timers
   overslept 5-8x (a 10 ms sleep took 75-85 ms on exonbook), so every
@@ -151,6 +201,21 @@ each section. Delete entries that stop being true.
   Privacy & Security for that app, and ask Ryan to grant it.
 
 ## Waiting on Ryan
+
+- 2026-10-15 (#67): the two Developer ID profiles exist (tied to the
+  2027 release certificate; secrets set) and a notarized Developer ID build
+  activated and streamed on isocast-m2-b. Left for Ryan: a QuickTime/Zoom/
+  FaceTime look on a Mac with a real display, and coexistence with OBS's
+  or NDI's camera (m2-b has none). m2-b still lists old Isocast builds as
+  "terminated waiting to uninstall on reboot"; they go at its next reboot.
+- 2026-10-14 (motion harness): the test Macs' desktop bridge may not post
+  mouse events (no Accessibility), so `scripts/motion/pointer.swift`
+  can't replay a scenario's whole path in a real window; window.py falls
+  back to one straight cua-driver drag. To get full paths and timed lag:
+  on isocast-m2-b, System Settings › Privacy & Security › Accessibility,
+  add the bridge's shell (or /usr/bin/swift), then retry
+  `ISOCAST_TESTMAC=isocast-m2-b scripts/testmac.sh gui 'scripts/motion.sh --window --bin target/release'`.
+  Blocks nothing else.
 
 - 2026-10-14 (8.2h auto-update, #40): the Sparkle update key. Until
   `scripts/sparkle/public-ed-key.txt` holds the real public key, every
@@ -306,6 +371,18 @@ each section. Delete entries that stop being true.
   synthetic sources, in-process and through the daemon. Needs GStreamer
   with `gst-libav` (AAC). Try: `cargo build && ISOCAST_DAEMON=$PWD/target/debug/isocastd
   ./target/debug/isocast record --source screen --source mic --seconds 10`.
+
+- 2026-10-15 (#71): **OBS tools can drive Isocast.** `isocast websocket
+  enable` prints ws://127.0.0.1:4455 and a password once; enter both in the
+  tool's OBS WebSocket settings (Touch Portal, Streamer.bot, Companion,
+  obs-cmd). Elgato's official Stream Deck OBS actions use their own OBS
+  plugin, not obs-websocket, so they don't connect.
+
+- 2026-10-14 (motion harness, #24): `scripts/motion.sh` (after
+  `cargo build --release -p isocast-ui -p isocast-daemon -p isocast-cli`)
+  runs the motion suite headless in ~3 minutes and writes a table plus a
+  contact sheet per failing run; docs/motion-testing.md says what each
+  number means. It currently fails on main as #24 says it should.
 
 - 2026-10-14 (8.2): **Isocast 0.0.2 is published**, the first release that
   updates itself: https://github.com/R44VC0RP/isocast/releases/tag/v0.0.2
@@ -505,6 +582,24 @@ each section. Delete entries that stop being true.
 
 ## Questions for Ryan
 
+- 2026-10-15 (#18): with a `[stream]` in the profile the replay buffer
+  always encodes as the stream does (its size, bitrate, 2 s keyframes),
+  even while not streaming, so it can share the stream's encoder: a profile
+  streaming 720p/6 Mb/s gets 720p replays of a 4K program. Keep that, or
+  use the stream's format only while a stream runs (a
+  `recording.replay.follow_stream` switch)? Nothing waits on it.
+
+- 2026-10-15 (#18): may `replay/mp4.rs` and the replay ring's trimming get
+  unit tests (box layout, edit lists, keyframe/memory trimming with
+  synthetic samples)? They were verified with real saves (ffprobe, ffmpeg
+  -xerror, AVFoundation decoding every sample) and the e2e `replay`
+  scenario only. Nothing waits on it.
+
+- 2026-10-15 (#61): may the EBML reader (`matroska.rs`) get unit tests
+  with tiny byte-level fixtures built in the test (lacing kinds,
+  unknown-size clusters, truncated files, BlockAdditions, Cues)? It was
+  verified with real ffmpeg files only. Nothing waits on it.
+
 - 2026-10-11: Ryan's primary camera is "Studio Video" and his mic "Studio
   Audio" (XLR, network); `examples/recording.toml` now uses them instead of
   the OBS collection's "Capture Card" facecam. Asked whether a capture card
@@ -513,6 +608,63 @@ each section. Delete entries that stop being true.
 
 ## Benchmarks
 
+- 2026-10-15 (#3 default-on, final runtime b240e043, main 505145d baseline):
+  M2-b, `bench.py flagship-1080`, three interleaved 20 s pairs: daemon CPU
+  31.1% (31.0–31.1) → 25.7% (25.7–25.8), instructions 557.6 → 486.1 M/s,
+  VT CPU 13.7% both, RSS 121 → 138 MB, disk 251.1 → 246.4 MB, billed energy
+  0.20 → 0.19 J (tiny rusage counter, not machine power). Zero losses, 18/18
+  complete; both benchmark batches' 36 movies decode. Final M4 record-first
+  #68 matrix 35/35 files, ISO/program/stream 0/0/0; M2 fitting/heavy split
+  matrix 39/39, all protected outputs and audio loss-free, overloaded ISOs
+  still shed. Final kill matrix 7/7 + ownership 11/11: max video loss .454 s,
+  audio .635 s, next-launch repair 104–132 ms; earlier 21-case matrix .512 s
+  video/.682 s audio, 101–167 ms repair. Empty tracks omitted by recovery are
+  not lost packets: the initial checker falsely failed "None of 0"; corrected
+  checks pass on the exact retained files. Raw failing reports remain.
+  HEVC 10-bit, all ProRes variants, WebM playback and Create thumbnails pass;
+  full strict e2e 16/16 once, final affected scenarios 5/5, workspace 201 tests.
+  Evidence: `/Volumes/IsocastBuild/g3b-crash-safe/scratch/REPORT.md`, jobs
+  20261015-202302-g3b-005-cmd and 20261015-205333-g3b-start-fix-cmd. No m2-a use.
+
+- 2026-10-14: **G.3b crash-safe prototype (branch `agent/g3b-crash-safe`)**,
+  isocast-m2-a (base M2, macOS 27.0), synthetic sources, common lock, no
+  screensharingd. Kill matrix (`kill -9` at random media times, during a
+  pause, right after start, 160 ms into a split's new take, after resume;
+  HEVC/H.264/ProRes 422, MOV/MP4; 640×360/30 ISO + program; isolated
+  engines; recovery by `isocast restart` on the folder): flag on, 15 runs /
+  36 files: **36/36 decode fully (`ffmpeg -xerror`) after recovery, 36/36
+  unfinished files read by AVAssetReader before it**; video loss vs the
+  last status ≤ **0.499 s** (median 0.146), program audio ≤ 0.681 s
+  (median 0.209); a kill during a pause recovers the video exactly to the
+  cut and the audio exactly to the stated `recoverable_seconds_at_pause`
+  (cut − 47 ms); recovery 135–157 ms including the restart; pause replies
+  260–269 ms (25–86 ms with AVAssetWriter). Same 25 cases with the flag
+  off: 30/60 files unreadable (every take under ~2 s), loss up to 2.161 s,
+  a pause kill loses 1.9 s. Fix round 1 (review repros re-run on the
+  fixed build, `/Volumes/IsocastBuild/g3b-crash-safe/scratch/REPORT.md`
+  "Fix round 1"): the reviewer's four SIGSTOP stall cases now finish with
+  `mdhd` = `stts` = edit = ffprobe video end = AVFoundation decoded end
+  (3.983/4.333/5.683/5.100 s, gaps of 39000–59000 ticks kept in the
+  table); their 28-run matrix: 48/48 picture-bearing files decode in
+  ffmpeg with every AVFoundation track complete (15 files were killed
+  before any frame); the EIO write, fsync-at-pause and fsync-at-split
+  injections fail the file loudly (pause reply `errors`, manifest) and
+  the file is finished from its fragments; the torn 8-byte header patch
+  is recovered. Fix round 2 (re-review repros): the VT drop interposer's
+  injected drops reach the manifest (84/6, 89/1), all 17 torn header
+  states (0–16 bytes) recover on real media, the live-alias probe leaves
+  the owner's file untouched (refused as a symbolic link), a stall right
+  after the first picture leaves no raw `tfdt` gap, the EIO'd file's
+  manifest says 1 frame / 77 dropped (the movie's content); flag off vs
+  main on `camera-1080` (no 4K ISO, #41): 449.2 vs 448.2 M
+  instructions/s, 41.7 vs 41.5 % CPU, 6/6 complete, 0 drops; flag on
+  404.8 M/s, +7 MB RSS. A/B `scripts/bench.py` flagship-1080, 3
+  interleaved 20 s runs: main e9753d4 vs branch flag off **562.3 vs 562.3
+  M instructions/s**, 49.8 vs 50.0 % CPU, 124 vs 126 MB, 0 drops; flag off
+  vs on (final build) 563.5 vs **499.9 M instructions/s** (−11 %), 51.7 vs
+  44.0 % CPU, VT 29.2 vs 29.9 %, RSS 124 vs **147 MB**, disk 248 vs 221 MB
+  per 20 s, sizes 466/215/75 vs 468/209/76 MB/min, 0 drops, 9/9 complete.
+  Evidence: /Volumes/IsocastBuild/g3b-crash-safe/scratch/REPORT.md.
 - 2026-10-14 (iso-drops, #42-only qualification): baseline 63be94c versus
   10fc1a8 on isocast-m2-a, SSH, synthetic benchmark clips, 3 interleaved
   pairs/scenario, both common locks, no screen sharing. Healthy flagship-1080:
@@ -1453,6 +1605,153 @@ each section. Delete entries that stop being true.
 
 ## Decisions
 
+- 2026-10-16 (#82): **A given-up source open frees the way for a fresh
+  one.** Native opens can't be cancelled, so `bounded_open` keeps each
+  timed-out open's thread until macOS returns, but keys them by source and
+  device (the kind's settings) and allows 2 stuck per key (32 in all); at
+  the limit a new open waits within the same 8 s for one to return. The
+  engine retries failed sources every 5 s, so a hung driver costs at most
+  2 threads per device. Logs: "source open given up" and "given-up source
+  open returned" (with seconds and outcome).
+- 2026-10-16 (#83): **The release engine's executable is "Isocast
+  Engine".** macOS's camera-extension approval alert names the requesting
+  executable, so `release.sh` copies Cargo's `isocastd` to
+  `Isocast.app/Contents/Helpers/Isocast Engine.app/Contents/MacOS/Isocast Engine`
+  (CFBundleExecutable to match). Kept: the bundle id `dev.isocast.isocastd`
+  (signing identity, provisioning profile, app group, TCC), Cargo's binary
+  name, the development app (`Isocast Dev.app/Contents/MacOS/isocastd`) and
+  every script that runs `target/release/isocastd`, and the logs' process
+  label `isocastd` (log file names, crash/diagnostics bundles). Finders of
+  the release engine accept both names (`api::is_engine_executable`): the
+  client's bundled helper, the permissions preflight self-spawn and the
+  extension's producer path pin. Not "Isocast": the app's own window and
+  menus already are, and two "Isocast" processes would be confusing.
+
+- 2026-10-16 (#79): **Recording-native submission pressure, not just the
+  writer queue.** On m2-b, five 1080p60 ISOs plus program blocked all six
+  crash-safe writer threads in VTCompressionSessionEncodeFrame (~17.7 ms
+  per picture), leaving `pending_video` empty while each upstream 64-packet
+  mixed A/V channel filled. These files record the tone directly: not mixer
+  starvation. Program input age reached ~431 ms; native samples found
+  968–976/983 samples per writer in EncodeFrame. The crash-safe writer now
+  publishes a protected native submission's frame-budget overrun, excluding
+  its first picture (#60/#41), and keeps it across audio-only drains. ISO
+  startup backlogs also wait while a protected output is stalled; accepted
+  pictures are retained, audio/output still drain, and commit/finalization
+  explicitly force accepted video through. Merely time-bounding each drain
+  did not stop startup audio loss: every audio packet still submitted more
+  blocked ISO video. That experiment and diagnostic logging were removed.
+  Three interleaved 20 s A/B pairs: baseline six takes lose 48–55 program
+  frames / 494–561 audio chunks; final 0/0. Program submit ~17.7→0.35 ms,
+  input age ~431→22 ms (medians of three runs). #60/#68 controls and full
+  strict e2e 16/16 pass; final stock stress isos and workspace fmt/clippy/
+  212 tests/doctests pass. Evidence: capacity-limit/scratch/REPORT.md on the
+  build volume. Legacy AVAssetWriter is unchanged; all proof uses the
+  default crash-safe path.
+- 2026-10-16 (#79): **M2 capacity has per-picture overhead and overload
+  recovery loss.** Keep the measured 800 Mpx/s engine, add 250k equivalent
+  pixels per H.264/HEVC picture on the measured base M2 only: three sessions
+  (4K+HD ISOs, HD program) are 792 Mpx/s, while six HD sessions at the same
+  raw 747 Mpx/s are 837 Mpx/s. Both behaviors were measured; lowering the
+  engine rate alone would falsely reject the first. Four HD ISOs remain
+  loss-free. Under overload, the M2 table budgets half the theoretical spare
+  ISO share for pressure pauses and slow recovery: five HD ISOs predict
+  ~53% loss (observed 38–55% over 20 s), eight plus stream ~82% (73–87%).
+  Other chips retain their previous estimates; stream H.264's 1.9x cost
+  remains assumed. This is a cautious short-take estimate, not an exact
+  throughput forecast. No controller constants or codec settings changed.
+
+- 2026-10-16 (S.2): **The stress suite checks correctness, not speed**
+  (`scripts/stress.py`, hw-batch kind `stress`). Each scenario gets its
+  own engine; the bar is no lost or damaged file (every file a start or
+  split returned must exist in a complete manifest and decode with its
+  frames accounted), no program/stream drop or audio dropout, no crash,
+  panic or slow shutdown, only documented refusals from the API, and
+  footprint/threads/fds back near their pre-load values (300 MB / 24 /
+  32). ISO drops are reported, never failed: shedding them is the design.
+  The `disk` scenario accepts a manifest `failed` with "stopped early …
+  the files were finished and are playable" (the engine's own wording
+  for the keep-free stop). Scene switches acknowledged within the same
+  frame as the next one may be missing from the manifest (never on air).
+- 2026-10-16 (#45): **`tune` stays outside the `starting` gate.** A
+  benchmark takes minutes, and holding the gate made `shutdown_if_idle`
+  (restart, the updater) wait instead of refuse. Tune checks
+  `shutting_down` under the state lock before setting `tuning`, and
+  shutdown_if_idle sets `shutting_down` before taking that lock, so one
+  always sees the other. Optimize still holds the gate (no busy flag). The
+  app's own busy check can't see a tune, so after an engine Busy refusal it
+  waits 15 s before asking again.
+- 2026-10-16 (#55): **The Pacing row is "N late · p99 X ms"**, count
+  first, so the value column never elides the part that matters. The
+  auto-off switch keeps a profile's custom hours and names them.
+
+- 2026-10-16 (#77): **Detach the warm program tap, not the native session.**
+  After the warm picture completes, remove both routes before publishing
+  readiness. A typed `ProgramTapSource` observes engine stop while parked;
+  first real join restores the routes synchronously and hands the tap to the
+  worker on a one-slot channel. Share the sinks lock with parking and the
+  engine-state lock with canvas updates: asynchronous re-tap let a running
+  60-fps replay accept a 30-fps canvas edit (review B1, reproduced with four
+  drops); ten final attempts refuse it. Keep the original audio-loss counter
+  and #68's contiguous native timeline. Once used, continue encoding until
+  all outputs/reservations leave, as before. A parked canvas edit is allowed;
+  changed-FPS joining can use another session while the old reservation
+  survives the take. Heavy M2-b edit→join qualification has no stream/ISO
+  loss. Final CPU median old/fixed/no-stream: 2.919/2.359/2.432% of eight
+  cores, program draws 1219–1220/0/0 per 20 s. 150 s park: 5,406 B first
+  packet, +1.91 MiB RSS over 20 s after join, zero losses. Tier-1 re-review
+  approves; full gates 206 tests. Full strict e2e was 15/16 (replay sync
+  33.31 ms, not reproduced by two baseline/two fixed controls or the final
+  targeted stream/replay pass); do not claim an established baseline cause.
+  Evidence: `/Volumes/IsocastBuild/parked-tap/scratch/REPORT.md`.
+
+- 2026-10-16 (#4): console processes (CLI, app, UI) write their clean-exit
+  mark with a plain `fsync`, not `sync_all` (F_FULLFSYNC), and prune their
+  logs folder on the maintenance thread instead of before the command;
+  `clean_exit` waits for that prune (5 s cap) unless isocastd answered the
+  process (`isocast_diagnostics::daemon_answered`, called by the client),
+  since the daemon prunes the same folder every 30 s. The daemon keeps
+  F_FULLFSYNC and its synchronous start-up prune. Why: the scene-switch
+  "API round trip" QA timed is `isocast scene X --cut` wall time, and the
+  daemon's part is 0.02-0.05 ms; the A.6 diagnostics added 5-6 ms of disk
+  syncing and scanning to every CLI run. Left: the CLI starts ~0.9 ms slower
+  than at QA-2 without any logging (a larger binary and command tree).
+- 2026-10-16 (#56, plugin follow-ups): (1) the writer's and repair's
+  hard-link check (AssetWriter `not_plain`, `open_for_repair`) refuses a
+  file with more than one name only where the volume can make hard links
+  (`pathconf(_PC_LINK_MAX)` > 1; APFS 32767, exFAT and FAT say 1); any
+  other count is logged and recorded/repaired. Symlinks, non-files and the
+  pre-existing-entry refusal are unchanged; an APFS hard link still stops
+  repair. (2) Healing a clip by manifest name gives it its project's id
+  (`move_folder` takes the id; rename_project passes it too). (3) Export
+  manifests are healed by `list_projects` (and with a timeline heal): one
+  whose own files' folder is gone while the files are beside it is
+  rewritten from that folder to its own, skipping `exporting` ones. Exports
+  written outside the renamed project aren't rewritten (as rename_project).
+  (4) Seatbelt rules can't change in a running process, so
+  `Registry::refresh_sandboxes` (after `start` picks its project, and on
+  `setup_changed`) restarts a sandboxed plugin process whose sandbox lacks
+  a recordings folder that exists now or, for `write`, a not-a-project
+  folder named like one; not counted as a crash. Such a plugin can miss
+  that recording's `started`/`project_created`. (5) The recordings-folders
+  list moved to `isocast_protocol::project::{remembered_roots,
+  remember_root}`, and standalone `isocast record` adds its folder, so
+  `list_projects` shows its projects. Fix round 1 (review B1): two
+  processes write it, so the read/merge/write holds an flock on
+  `….json.lock`, writes a `create_new` file of its own and renames it in,
+  and keeps `….json.bak`; an unparseable registry is read from the `.bak`
+  and moved aside as `….json.unreadable` on the next write, never
+  silently replaced by `[]`. Repair asks the link limit via `fpathconf` on
+  the opened file (F1).
+
+- 2026-10-16 (#76): crash-safe files carry the take's start as creation
+  and modification time in `mvhd`, `tkhd` and `mdhd` (QuickTime epoch,
+  whole seconds; version 1 headers only when a time or duration passes
+  32 bits, i.e. after 2040). The time is `plan_take`'s clock, the one the
+  file names use, so every file of a take shares it; it is written into the
+  fragmented `moov` at creation and read back from there by `recover`, so a
+  repaired file keeps it. AVFoundation reads it as `creationDate`.
+
 - 2026-10-15 (Joe, L): **Linux backend on GStreamer** (`gstreamer-rs`
   0.25): capture, NVENC/VA-API/x264 encoding and fragmented MOV/MP4 in
   one stable C API. The system FFmpeg (libavcodec 63) is newer than the
@@ -1463,6 +1762,552 @@ each section. Delete entries that stop being true.
   frames on). DMA-BUF zero-copy later. 10-bit and ProRes refuse with
   the valid options. Encoder quality 1–100 maps to a quantiser
   `40 - q/4` (NVENC VBR const-quality, x264 CRF, VA CQP).
+
+- 2026-10-15 (#73): **Multistream = one Stream per destination on the
+  shared program encoder.** `[stream]` stays the main destination (id
+  `main`, Keychain account unchanged, no migration); `[[stream.destinations]]`
+  inherit everything but service, server, enabled, bitrate and size. Each
+  destination is a full `Stream` (queue, reconnects, counters), so failures
+  stay per destination; equal `EncoderSpec`s join one hub (`encoder.rs`
+  already fanned packets out to sinks), so matching destinations are one
+  encode. Keyframe requests (a reconnect) hit every sink of the hub; queues
+  that aren't starting ignore `start_at`, so the live ones only get an
+  extra keyframe. A different format is a second encode, admitted by
+  `estimate_capacity` with the recording counted only while one runs; no
+  estimate (non-macOS) admits. Added destinations' key account is
+  `<service or server> [id]`. `status.stream` / obs-websocket stay the
+  main destination; `status.streams` has all; StreamStart/Stop return
+  `Streaming` (main status flattened, so single-destination clients parse
+  it as before, plus `destinations`). Start refuses as a whole on a missing
+  key/server (nothing half-starts); a connection or encoder failing at start
+  fails only that destination. Settings shows the per-destination state in
+  the status bar's LIVE details; a dot per destination on the dock button
+  was tried and dropped (can't name them). #68's record-first warm encoder
+  is still the main destination's spec only: an own-format destination
+  isn't pre-placed (follow-up).
+
+- 2026-10-15 (#70, C.3c, Ryan's requirement): **The editor is its own
+  window, "Isocast Editor — <timeline>"** (Window › Editor, ⌘E, or a
+  clip's "Open in Editor"), never a change to the studio. Tried offscreen
+  against a full-window mode over the studio
+  (edit-view/scratch/snaps2/editor-window.png, editor-mode.png) and chose
+  the window: the studio keeps running beside it (scenes, monitors,
+  recording), it can sit on another display, and which one you are in is
+  the window you are looking at. Its layout: a viewer of the angle at the
+  playhead over the timeline with every ISO track. The studio's Create
+  view keeps C.2's clip bar exactly (record into a timeline, retake,
+  reorder, export; its thumbnails pick C.2's 8 frames of the 24 now
+  made). The editor has its own keys (S, I, O, Delete, J K L, arrows,
+  1–9 angles, Esc, ⌘Z/⇧⌘Z), so the studio's keys are unchanged. Clip
+  names are the take's number in recording order, so a split take keeps
+  one. Offscreen, `--state editor` opens it and snapshots draw it.
+
+- 2026-10-15 (#70, C.3): **Edits are clips.** Trim, split, ripple delete
+  and angle selection only change a timeline's clips (in/out points on the
+  take's clock, order, and a new `angle` per clip); an angle over a span
+  splits the clips at its ends, so the edited video is still a list of
+  clips. Points snap to the take's program frame grid. Each edit pushes the
+  clips and removed takes before it onto `undo` (at most 100, kept in the
+  timeline file so undo survives a restart); a recorded take (append,
+  retake) clears the history instead of being undoable, because undoing an
+  edit made before a take must not drop the take. A take whose last clip is
+  deleted is listed under `removed`, as `timeline_remove` does.
+- 2026-10-15 (#70, C.3): **Edited export.** The edited file shows each
+  clip's angle with the program's sound (the program mix; ISO files carry
+  their own sources' audio, whose tracks differ between angles), in the
+  program's codec, size and frame rate. Video is copied except (a) from a
+  cut that isn't on a keyframe to the next keyframe (the frame on screen at
+  the in point, then the rest of that interval), decoded and encoded again
+  with VideoToolbox in the same codec at quality 0.85 (the take's own
+  quality isn't in its manifest; 0.85 is above recordings' default, so the
+  re-encoded second matches the copied ones: MSE ≤ 0.8 on the test
+  pattern's bars against the source frame), and (b) angles in another
+  format, encoded again whole on the program's frame grid, letterboxed. A
+  part ends at its last frame starting before its end, which needs nothing
+  encoded again because recordings have no reordered frames (an export
+  refuses a file that has them). Audio: each part's track is read from
+  its in point (a ranged reader, aligned by the first buffer's time), cut
+  to the sample, and the outgoing part's next 480 samples are faded out
+  under the incoming part's first 480 (linear, 10 ms, or over less where
+  the outgoing file's audio ends sooner), at every join including C.1's
+  take joins. The joined file's frame rate is the take's grid (the
+  manifest's fps), not the file's average, which dropped frames pull
+  down. Undo restores clips and the takes edits took off; takes recording
+  took off meanwhile (dropped, interrupted) stay listed. An edit that
+  changes nothing is no revision.
+- 2026-10-15 (#3, G.3b 0.0.5): **default on, 500 ms, keep every frame.**
+  Ryan chose a temporary `ISOCAST_CRASH_SAFE=0` legacy fallback for one
+  release, not a new setup field; automatic next-launch repair suffices,
+  including remembered project folders. Recovery presents every kept
+  track to its own end, not the shortest A/V end. The approved retained
+  crash harness is `scripts/kill-matrix.py`. Integrate by merging main
+  505145d into the reviewed 96dc52d branch, preserving the three repair
+  fix rounds. New recording encoders must take #41's first-picture turns
+  (and drain startup backlog before enforcing the small ISO queue), while
+  #68's shared stream/replay session stays placed before recording and
+  retained across splits. Default-on qualification is in the new section
+  of `/Volumes/IsocastBuild/g3b-crash-safe/scratch/REPORT.md`; it is not
+  implied by the earlier default-off approval.
+
+- 2026-10-14 (G.3b lane, branch `agent/g3b-crash-safe`, not merged in the
+  alpha week): **crash-safe takes are our own encoders plus a fragmented
+  movie we write and finish ourselves** (`docs/crash-safe-takes.md`).
+  A `VTCompressionSession` per file with writer.rs's settings and the
+  existing AudioToolbox AAC encoder feed `crash_safe/mp4.rs`: `ftyp`, a
+  16-byte `free` placeholder, a fragmented `moov`, then `moof`+`mdat` per
+  500 ms of media (`ISOCAST_CRASH_SAFE_INTERVAL_MS`), the first picture
+  at once. Stop appends the real `moov` and turns the placeholder into one
+  `mdat` header, the layout AVAssetWriter's finished movies have (their
+  old fragment indexes sit inside the `mdat` the same way; checked on an
+  8 s HEVC take). An unfinished file is recognised by the placeholder and
+  finished from its fragments by `Platform::recover_file` at the next
+  launch. Rejected: rolling sealed segments (+29–62 % instructions, a
+  second AAC encode in the join, measured 2026-10-13) and a write-ahead
+  sample log (a copy of every byte at Stop, or nothing but Isocast can
+  open the take). The AAC priming (2112 samples) is an audio edit list
+  plus `roll` sample groups in the finished file (AVAssetReader needs the
+  groups to start at 0) and a video `tfdt` delay while fragmented, as in
+  AVAssetWriter's fMP4 output. A pause asks every crash-safe file to
+  drain its own queue and its encoder, write and flush up to the cut
+  before the manifest checkpoint, so `recoverable_seconds_at_pause` (and
+  the Pause reply's `recoverable_seconds`) is read back from the writers
+  (video exact to the cut, audio 44–65 ms short: the priming and the
+  partial packet, when the inputs arrived within 500 ms of the cut). A
+  commit that fails or does not answer in 3 s leaves the pause with no
+  number and its error in the reply, the manifest and the file's failure.
+  Each picture is held until the next one fixes its duration, so fragment
+  and final timing agree and gaps stay where they fell. Files a write
+  error failed are finished from their fragments at Stop and again at
+  every launch until that works. Originally `ISOCAST_CRASH_SAFE=1` only;
+  the 2026-10-15 decision above supersedes that default and shipping form.
+- 2026-10-15 (#64): **VP8 is decoded by a vendored libvpx, Vorbis by
+  lewton.** macOS decodes neither. Pure-Rust VP8 crates were scaffolds or
+  keyframe-only (WebP); the libvpx crates clone or download libvpx while
+  building. crates/isocast-vp8 holds libvpx 1.17.0's VP8 decoder sources
+  only (BSD-3, unchanged; provenance and the configure line in its
+  build.rs; LICENSE and PATENTS go into THIRD_PARTY_NOTICES) built with
+  cc, NEON chosen at compile time, ~310 KB. VP8 without alpha is copied
+  into 420v frames; with alpha (a second VP8 stream in BlockAdditional,
+  decoded every packet so its references stay in step) or full range,
+  vImage converts to BGRA and the alpha luma becomes the alpha channel.
+  Untagged VP8 is Rec. 709 like all untagged video (the VP8 spec says
+  601; OBS 28+ and our VP9 path use 709). Vorbis packets are decoded to
+  floats and fed to the same AudioConverter (it only resamples), so
+  trimming and looping are shared; the first packet gives no sound, so the
+  first sound gets its time. lewton (2021, mature, rodio's decoder) adds
+  only byteorder.
+  Cost on a base M2 (isocast-m2-b, hw job 20261015-220535-vp8-cmd, a
+  12 Mb/s 1080p60 testsrc2 stinger, harder than real ones): decode plus
+  conversion 4.4 ms a frame with alpha (3.8x real time; ffmpeg's libvpx
+  1 thread 4.6 ms), 2.3 ms without; looping as a media source while
+  recording, isocastd used 67% of a core with alpha and 54% without
+  (baseline 7%, VP9 alpha 24%, ProRes 4444 22%), 0 dropped frames in 90 s,
+  RSS flat at 243 MB (VP9 alpha 211, ProRes 393). Libvpx decodes on one
+  thread unless the stream has several token partitions.
+- 2026-10-15 (#33): **System and app audio through Core Audio process
+  taps, ScreenCaptureKit as the fallback.** `tap.rs`: a private
+  `CATapDescription` (global-but-exclude for system audio, mixdown of
+  processes for an app) read through a private aggregate device that holds
+  only the tap (no sub-device: an output with inputs, like AirPods, would
+  otherwise open its microphone and add its streams; review B1), IOProc on Core Audio's thread stamping each
+  buffer from `inInputTime.mHostTime`. Which backend: taps when System
+  Audio Recording (`kTCCServiceAudioCapture`) is granted; if it isn't but
+  screen recording is, SCK, so an existing setup never stops at a new
+  prompt mid-recording (or fails once it's turned down); with neither, a
+  tap (its prompt asks for less). Before 14.2 and with
+  `ISOCAST_AUDIO_CAPTURE=screencapturekit`, SCK. `AudioHardwareCreate/
+  DestroyProcessTap` are looked up with dlsym (deployment target 14.0).
+  Apps match by bundle id, name, part of the name or a tool's executable
+  name; a helper process belongs to the app `responsibility_get_pid_
+  responsible_for_pid` names (browsers' helpers, WebKit's GPU process);
+  a tool started from a terminal belongs to itself. The tap's process
+  list follows `kAudioHardwarePropertyProcessObjectList` (set
+  `kAudioTapPropertyDescription`, same UUID); a change of default output,
+  of the tap's format or a dead aggregate rebuilds tap and device (the
+  engine fills the gap). `system_audio.exclude` lists apps to leave out
+  (OBS-style "all but"); under SCK only apps SCK lists can be left out.
+- 2026-10-15 (#33): **A fourth permission, `system_audio`.** Preflight and
+  request through TCC's SPI (`TCCAccessPreflight`/`TCCAccessRequest`,
+  dlopen'd), because opening a tap without a decision shows macOS's prompt
+  and blocks `AudioDeviceCreateIOProcID` until it's answered (the source
+  then times out after 8 s). It is reported granted before 14.2, is never
+  "needed" in the app's sheet (screen recording also records system
+  audio) and doctor flags it only when a setup plays system/app audio and
+  neither it nor screen recording is granted. `isocast permissions
+  --request` (all) asks for it too, so first-launch onboarding does.
+
+- 2026-10-15 (#68 review B1): **Exclude a parked gap from the native H.264
+  timeline, not the engine timeline.** VT's bitrate controller treated the
+  gap after the warm picture as unused budget (3 s: 1.96 MB first packet;
+  reviewer 150 s: 13.6 MB and a ~0.9 GB memory spike). On the first live
+  picture, subtract its distance from `warm_pts + frame_duration` from all
+  native submissions, then add the offset back to returned PTS/DTS before
+  interleaving. AAC, keyframe scheduling and loss accounting stay on the host
+  clock. Always discard the warm output, even if a subscriber joins before
+  it returns. A 150 s park now starts with 4,935 B, memory grows 0.84 MiB,
+  and both streams/replay/recordings remain clean. Native cold CBR normally
+  averages ~3 Mb/s in the first second at a 6 Mb/s target, then 6 Mb/s
+  (also measured on main); do not call that a regression or hide an upper
+  burst. The existing stream e2e now records first and checks first-packet
+  size plus the first two seconds' rates. Q4's parked-tap optimization is
+  deferred: retapping must preserve typed receiver ownership, audio-drop
+  counter baselines and engine-stop notification, beyond this timestamp fix.
+
+- 2026-10-15 (#68, iso-overshed follow-up): **Place, then park the shared
+  H.264 session before recording writers.** With `[stream]` or non-default
+  replay settings, recording reserves the existing shared program encoder,
+  waits for one native picture to complete, then starts its writers. The
+  reservation survives every split and ends with recording; actual stream
+  and replay subscribers keep the session when recording ends. Before any
+  real subscriber joins, discard tap packets and warm output, and do not
+  feed AAC or advance live timestamps. Once used, keep encoding through the
+  recording (including stream Stop) to preserve audio continuity and native
+  pressure cleanup. The reservation is not counted in `shared_encoder`.
+  A failed optional warmup warns instead of preventing a valid recording;
+  readiness waits at most 3 s and honors Stop. The first continuous-encode
+  reservation fixed M4 losses but retained M2 startup program drops; parking
+  after one picture fixed both. Final: M4 heavy record-first 6 s ×3, 181 s,
+  6×30 s splits all outputs 0 drops; M2 fit 0 and heavy program/stream 0,
+  with ISO overload still counted. No admission/gate/native codec changes.
+  On exonbook (14 cores), three interleaved 30 s recording-only trials with
+  a configured-but-unused 720p60 stream: daemon CPU 2.266% → 2.319% of the
+  whole machine (+0.743 percentage points of one core); continuous warming
+  was 2.863%. ISO-only (program disabled), three 20 s pairs: 1.376% → 1.963%
+  machine-wide (+8.230 core-points), all files loss-free. A parked encoder's
+  tap still keeps the otherwise-idle compositor at full rate; optimizing
+  that tap is a follow-up. This is CPU, not a watt/energy measurement. Default replay
+  settings are always present in the model, so only non-default replay
+  settings trigger a reservation without `[stream]`. Evidence and prior
+  rejected-policy investigation: `/Volumes/IsocastBuild/iso-overshed/scratch/`.
+- 2026-10-15 (#49, fixes-005): **an engine older than the bundled one is
+  restarted; a newer one never is.** `isocast_client::stale_engine`
+  compares `status.daemon.build` (absent before #40: stale) with the
+  bundled helper's `CFBundleVersion`, as numbers (release.sh and build.rs
+  both number builds by time), at any executable path (an older copy's or
+  a dev engine on the default socket too). Only distributions check (a
+  bundled helper next to the binary, no `$ISOCAST_DAEMON`); dev builds'
+  plist build (`vcam-package.py stamp`) isn't the binary's, so they can't.
+  The app stops it with `shutdown_if_idle` and lets the link launch the
+  bundled one, with a notice; while busy a sticky notice says it restarts
+  after, and it does. The CLI only warns (`status`, `start`, `stream
+  start`) and suggests `isocast restart`. Two apps of different builds
+  can't ping-pong: the older one sees a newer engine and leaves it.
+- 2026-10-15 (#71, G.9): **obs-websocket is a client of the method table,
+  in-process.** Crate isocast-obsws speaks the protocol; isocastd hands it
+  an `Engine` (daemon.call with the API audit log, and an ordinary event
+  watcher). OBS events that Isocast has no event for (mute, volume, names,
+  scene items, transitions, settings) come from diffing the live setup on
+  each `setup_changed`, so they fire whoever changed it. Names and ids:
+  OBS name = Isocast name or id (later duplicates get ` [id]`); lookups
+  also take the id; uuid = SHA-256(`isocast:<kind>:<id>`) as a v8 UUID;
+  sceneItemId = 31-bit hash of scene id + item key (stable across
+  reorders). Studio mode = a staged preview, as the hotkey does. The
+  settings are per engine (`<setup>.websocket.json`), not per profile, as
+  in OBS; the password is a Keychain item (`<app id>.websocket`) and the
+  first enable generates and shows one; with auth on and no readable
+  password it stays off (fails closed). Unmapped OBS requests answer 204
+  UnknownRequestType with "Isocast does not support X" (the protocol has
+  no separate "unsupported" code). It reports obsVersion 30.2.0 and
+  obs-websocket 5.5.0, the versions whose requests it maps.
+- 2026-10-15 (#72): **per-ISO audio is `recording.iso.source_audio`, a map
+  from an ISO source's id to its audio tracks**, beside the shared
+  `recording.iso.audio` (both in the scene collection, as they name its
+  sources). Not `sources[].iso_audio`: sources is a list of tables and
+  `audio.iso` is already that source's own-sound bool, while the ISO choice
+  itself lives in `recording.iso.sources`; a map merges by key in patches
+  (`{"cam": null}` = back to the default). An entry replaces the shared
+  list for that file only; `audio.iso` still adds/drops the file's own
+  sound on top of either list. Keys must be video sources (not necessarily
+  listed in `recording.iso.sources`, so turning a file off and on keeps its
+  routing); the app's Remove cascades the key and values. OBS import maps
+  Source Record's "different audio" source to that source's entry; without
+  it Source Record records the source's own sound (source-record.c uses the
+  filter's parent), so the shared list is now left omitted instead of `[]`.
+  App: Settings › Output shows "Audio: Same as Others / each source"
+  checkboxes under each recorded ISO source (a menu button inside the
+  sheet was tried: in the offscreen loop the sheet's PopupWindow offsets
+  `absolute-position`, so the menu opened ~(500, 274) pt from its button);
+  the Sources dock's ISO badge gets a right-click/Control-click menu with
+  the same choices flat under Record ISO File (picked over an "ISO Audio ▸"
+  submenu there: the badge menu is short, so one click), and the item's
+  context menu has an "ISO Audio ▸" submenu (that menu is long).
+
+- 2026-10-15 (#18, G.2): **the replay buffer is a sink of a shared program
+  encoder.** The stream's H.264/AAC encode thread became
+  `stream/encoder.rs`: outputs with an equal `EncoderSpec` subscribe to one
+  running encoder (one hardware session, #41/#60), the last to leave stops
+  it, as OBS's outputs share encoders. The buffer asks for the stream's spec
+  whenever the setup has a `[stream]`, so stream + replay is one session
+  whichever starts first, and the buffer keeps the encoder when the stream
+  stops; without a `[stream]` it encodes on its own (program file size,
+  1 s keyframes, ~0.1 bit/pixel up to 40 Mb/s). Recordings encode inside
+  AVAssetWriter, so sharing the program *recording's* encoder needs our own
+  VT session feeding a passthrough writer (G.3b's direction): follow-up.
+  Not chosen: handing the buffer from its own encoder to the stream's
+  mid-run (two parameter sets in one buffer, a gap at each handover).
+- 2026-10-15 (#18): **saved replays are muxed by our own MOV/MP4 writer**
+  (`replay/mp4.rs`, ~500 lines), not AVAssetWriter passthrough: every
+  sample is in memory, so `moov` goes first with exact offsets and no
+  CMSampleBuffer/format-description FFI is needed; files are written under
+  a hidden `.partial` name, fsynced, then hard-linked to a free
+  `Replay <date> <time>` name (rename fallback where hard links fail).
+  A save ends at the picture showing when it was asked for (waiting up to
+  3 s for it and its audio to leave the encoder); it starts at the newest
+  keyframe at least `seconds` before that. It goes into the running
+  recording's project folder, else the recordings folder (as OBS saves
+  beside recordings). The buffer's own H.264 encoder publishes pressure
+  like the stream's (protected ahead of ISOs).
+- 2026-10-15 (#18, app): the Controls dock's seventh row (Replay Buffer +
+  Save Replay, between recording and the virtual camera, OBS's order)
+  moves Exit beside Settings below a 272 px dock row and tightens spacing
+  below 240 px. Settings › Output has a Replay Buffer group (length, memory).
+- 2026-10-15 (#66): **capacity estimate = per-chip data, not a benchmark.**
+  `estimate_capacity` packs every H.264/HEVC encoder (program, stream, ISO
+  files) onto the chip's encode engines, largest first onto the least busy
+  (a session stays on one engine, #41), and judges the busiest engine's
+  pixel rate against `media_engines.json`: fits <= 0.85, no margin <= 1.
+  H.264 costs 1.9x HEVC per picture (tune on m2-b: the same ISO files
+  1.28x vs 0.72x and 1.04x vs 0.60x real time), so H.264 files are offered
+  HEVC and never the reverse; the stream's H.264 is counted the same
+  (unmeasured on its own). ProRes isn't counted (tune ran ProRes ISOs at
+  3.2x beside an HEVC program on the M2: its own engines). Chips not
+  in the table get their generation's per-engine rate and their tier's
+  engine count (base/Pro 1, Max 2, Ultra 4), labelled "assumed". A tune
+  measurement that couldn't keep up overrules the prediction. Suggestions
+  are tune's closeness costs, singles and pairs, at most one per target;
+  "lower an ISO's size/fps" only exists for cameras and test patterns (a
+  screen records at its own size). Adding an ISO file (Sources dock) only
+  ever changes that source: as is if it keeps up (no margin counts), else
+  smaller/slower, else off, and says why. "Don't show again for this
+  setup" keys on `workload_key` (the outputs' sizes, rates and codecs) in
+  `isocast-ui-notices.json` beside the layout prefs. Integration point for
+  first-launch Optimize (#46) and the record button: call
+  `Method::EstimateCapacity(CapacityParams { setup: Some(candidate), stream,
+  add_iso })` per ISO candidate and apply `admission.change`; `start`
+  already notes a can't-keep-up prediction.
+- 2026-10-15 (#67): **The release app ships the camera extension.** It sits
+  in `Isocast Engine.app/Contents/Library/SystemExtensions` (the engine,
+  `dev.isocast.isocastd`, is the producer the extension admits and the app
+  that activates it), built with plain swiftc by
+  scripts/build-camera-extension.sh rather than Xcode, so release signing
+  stays manual Developer ID codesign with the given profiles (no Xcode
+  account/automatic signing on CI). Signed entitlements add
+  `com.apple.application-identifier` and `com.apple.developer.team-identifier`
+  (what Xcode would add; the profiles grant them) and, on the engine only,
+  system-extension.install and the Team-ID app group; the CLI keeps the plain
+  set (a restricted entitlement without a profile gets a binary killed).
+  Profiles must be Developer ID (no device list) with >=30 days left and
+  carry the signing certificate; the app group isn't required in the
+  profile (Team-ID-prefixed groups need no registration for Developer ID,
+  as the guide tells Ryan). **Start activates it** in release builds only:
+  a development engine (no embedded extension) still never installs
+  anything. Activation runs in a re-exec'd child (`--install-camera-extension
+  --wait-for-approval`) because OSSystemExtensionRequest delivers to a main
+  run loop the daemon doesn't run; after the approval prompt the child
+  keeps the request alive (15 min) so the engine can start the camera when
+  the user allows it, unless Stop came first.
+- 2026-10-15 (#67, first real activation, m2-b macOS 26.7): system
+  extensions must be **notarized** (an unnotarized Developer ID build fails
+  activation with "code signature invalid"). CMIO reports the producer's
+  signingID as "unknown", and the extension's sandbox can't look up another
+  process's code by pid (EPERM) but can read its path (proc_pidpath); the
+  extension now admits an app's Contents/MacOS/isocastd under /Applications.
+  The approval alert names "isocastd"; the password sheets name "Login
+  Items" / "Isocast Engine". Re-activating a newer build replaces the old
+  one without approval; deactivation needs an admin password and the same
+  build as the active one. Finder's Move to Trash leaves the camera active.
+  ffmpeg's avfoundation input accepts only `-framerate 240` for this camera
+  (its range check vs. the advertised 1–240 range); frames still arrive at
+  the producer's rate.
+- 2026-10-16 (#69, m2-b macOS 26.7, notarized Developer ID builds): an
+  `OSSystemExtensionRequest` for properties lists every build sysextd knows
+  (enabled, awaiting approval, uninstalling); `isocastd
+  --camera-extension-state` prints it as JSON. Start replaces another active
+  build with the app's in about 1.3 s with no prompt, and the camera runs
+  (151/151 distinct frames). Removal from a newer or older app copy works
+  after replacing the active build first; deactivating when nothing is active
+  still shows a password prompt, so removal now answers "already absent"
+  from the properties instead. A deactivation from an engine started over
+  ssh (no login session) fails at once with OSSystemExtensionErrorDomain 13
+  (authorization required) and no prompt; run the engine in the desktop
+  session (`scripts/testmac.sh gui`) to test removal. The approval alert
+  names the requesting executable ("isocastd") even with the helper
+  registered in Launch Services and Terminal as the responsible process; the
+  password sheets name the bundle ("Isocast Engine"). The extension runs as
+  `_cmiodalassistants`, so it shares no app group container with the user's
+  engine (no nonce channel). The SecurityAgent password sheet is not in
+  screenshots; type into it blind (the typepw helper) after it appears.
+- 2026-10-15 (#67): `x-apple.systempreferences:com.apple.LoginItems-Settings.extension`
+  opens System Settings › General › Login Items & Extensions on macOS 26.7
+  (isocast-m2-b); Camera Extensions is further down that page.
+
+- 2026-10-15 (#58): a disabled primary footer button uses the kit's
+  disabled footer style (hover fill, text-disabled label) everywhere, not
+  only in the permissions step: at 40% opacity the yellow read as enabled.
+  "Refused without asking" is flagged only in a login session with a
+  screen (SessionGetInfo's sessionHasGraphicAccess): over ssh nobody can be
+  asked, so "update" was the wrong advice. That keys on the session, not
+  on who launched the engine: a Terminal-started engine on the Mac's screen
+  does get prompts, so a fast refusal there is still a real no-prompt.
+
+- 2026-10-15 (#46, first launch and Auto-Configuration): the flow is a
+  wizard sheet (area I, src/areas/wizard.rs), chosen from three variants
+  drawn in the real app (scratch/shots/variants in the lane's folder):
+  A, a "Found in OBS" list inside Welcome; B, the sheet opening on From
+  OBS before Welcome; C, Welcome's primary button importing OBS's current
+  collection. B because it is the first run's own sheet (same header
+  steps, footer and size, so no new visual language), it has room for
+  choosing several collections, the stream-key consent and OBS's
+  unreadable files, it continues straight into Goal and Summary, and
+  Tools › Auto-Configuration Wizard… reuses it (OBS opens its wizard the
+  same way). A crowded Welcome and had no room for the key or errors; C
+  hid the other collections and every profile's settings. The order is
+  permissions (area H), then the sheet if OBS has collections, else
+  Welcome; Not Now leads to Welcome, whose Import from OBS… reopens the
+  sheet (a file picker when nothing was found). Start with this Mac's
+  Create setup leads on to Goal. Tools › Set Up from This Mac… keeps the
+  old "start over" (the device steps).
+- 2026-10-15 (#46): optimize's rules (isocast_protocol::optimize):
+  recording favours quality, HEVC High (ProRes or a better preset kept)
+  for the program and ISO files, and ISO files of every captured source
+  when none are listed; streaming uses 75% of the upload in 500 kb/s
+  steps, within the service's ceiling (Twitch 6000, YouTube 12000 at
+  60 fps/9000 at 30, Facebook 9000, Kick 8000, custom 12000), sends
+  1080p from 6 Mb/s at 60 fps (4.5 at 30), 720p from 2.5, else 480p;
+  streaming alone turns ISO files off and drops to 30 fps under 4.5 Mb/s;
+  Both keeps the recording's rate and ISO files. Then `tune` checks the
+  result and its change is folded in; the summary line is built from the
+  final setup. The stream's encoder isn't benchmarked (tune knows
+  recording files only): a note says so.
+- 2026-10-15 (#46): the upload test publishes filler H.264 (SPS/PPS, one
+  black IDR so ffmpeg-like receivers learn the size, then filler NALs) and
+  measures by the server's RTMP acknowledgements (window 256 KB), falling
+  back to bytes sent in the second half; capped at 50 Mb/s, 8 s by
+  default. Only Twitch (its `?bandwidthtest=true` publish never goes on
+  air) and custom servers are tested; YouTube, Facebook and Kick have no
+  test mode, so a test would go live: they, and a missing key, get 6 Mb/s
+  (within the ceiling) and the reason. Applying in the app is one
+  undoable edit (replace_setup_then), not a second optimize.
+- 2026-10-15 (#61, WebM/MKV): Matroska and WebM files (EBML magic in the
+  first four bytes, whatever the extension) bypass AVFoundation:
+  `matroska.rs` (our own EBML reader; matroska-demuxer, the maintained
+  crate, drops BlockAdditions, where VP9 alpha lives) feeds
+  `webm.rs` (VideoToolbox, AudioToolbox). Untagged VP9 is treated as
+  Rec. 709, like untagged video everywhere in the engine (and OBS 28+);
+  ffmpeg's RGB->YUV default is 601, so an untagged ffmpeg-made file's
+  reds look slightly orange (G=24 for pure red), same as an untagged
+  MP4. A file's duration is its last video frame's end (from the last
+  cue point on) unless the stated Duration is >100 ms longer: Matroska's
+  Duration includes AAC/Opus padding, which held the last frame and
+  broke beep cadence (21 ms per loop) on looping MKVs. Audio past that
+  end is cut. Alpha is written into VideoToolbox's own BGRA buffer when
+  it says the buffer is modifiable (it always did here), else into a
+  pool copy. There is no seeking API, so Cues are only read for the end.
+- 2026-10-15 (#63): stream keys live under `<outermost app's bundle id>.stream`
+  (`dev.isocast.release.stream`, `dev.isocast.isocastd.stream` for the dev
+  app, `dev.isocast.update-test.stream`, `dev.isocast.unbundled.stream` for
+  a bare isocastd). The engine's own bundle id is `dev.isocast.isocastd` in
+  every build, so it can't separate them; the enclosing Isocast.app can. A
+  key under the 0.0.3 service `dev.isocast.stream` moves once if readable
+  without a prompt (then the old item is removed, so a cleared key can't
+  come back); an unreadable one is ignored for the daemon's lifetime. Set
+  and clear also remove the old item when this build may.
+- 2026-10-15 (#57): Local Network isn't in `isocast permissions`: macOS has
+  no API to read its state without triggering the prompt (NWBrowser or a
+  connect is the only probe), so it'd be a guess.
+
+- 2026-10-14 (motion harness, fix round 2): suites are trusted input
+  but boxed: plain scenario names, run folders only as plain children of
+  --out with only the harness's own files removed, an allowlist of state
+  steps, and --motion refuses to run without ISOCAST_SOCKET and
+  ISOCAST_SETUP. Lag is reported only when the gain is within 20% of 1.
+
+- 2026-10-14 (motion harness, review fix round): the app reads time
+  through `crate::clock` (src/clock.rs): the wall clock normally, the
+  virtual display's under `--motion`, so lockstep is deterministic
+  (repeated runs draw identical frames, checked by
+  scripts/motion/compare.py). A measurement that couldn't be made
+  (target missing in any gesture frame, engine not caught up within 2 s)
+  fails the run. Stalls are judged on the device-pixel grid.
+  scripts/motion/controls.toml (a good drag passes; injected lag, jump
+  and blank frame fail) is the harness's own regression check.
+
+- 2026-10-14 (motion harness, GitHub #24): Ryan approved new test
+  infrastructure for this. `isocast-ui --motion SUITE.toml` (src/motion)
+  runs one scenario per process on its own offscreen platform (the
+  snapshot code's, plus a virtual clock and a redraw counter), with the
+  preview in image mode (no layers offscreen), and `scripts/motion.sh`
+  gives each run a fresh throwaway engine. Lockstep (each frame waits up
+  to 250 ms for the engine) for CI, realtime for this Mac, the real window
+  for the test Macs. The lag/gap is measured against the pointer, not
+  against the drawn box: drag-lag.py's "0 px" compared the box with the
+  picture, both drawn from the same frame, while both trail the pointer.
+  Suites are TOML (the toml crate, already the setup format).
+- 2026-10-15 (nightly soak): **the hosted soak checks slow failures, never
+  drop counts.** `scripts/soak.py` reuses e2e.py's `Engine` (same
+  isolation) and verifies each take while recording, deleting its media,
+  so disk stays at about two takes (30-min splits). Memory is the process
+  footprint (`proc_pid_rusage`, what Activity Monitor shows) rather than
+  RSS, measured only while recording, after a warm-up of min(10 min, 20%);
+  limits: +200 MB, +16 threads, +32 fds (median of the last third minus the
+  first). Baseline on isocast-m2-a: ~125 MB, 47 threads, 18 fds, flat over
+  12 min. ffmpeg's receiver logs "Error during demuxing: Input/output
+  error" when the sender closes; it's filtered, and disconnects are judged
+  by the connection count and `reconnects`. After a crash or hang the
+  report shows only that failure, not what follows from it.
+- 2026-10-15 (#60): **Stream pressure must include time blocked inside
+  VideoToolbox, not just our eight-frame submission limit.** In the M5 soak,
+  bad takes had zero writer refusals and empty writer queues; compositor
+  misses rose, while the stream's callbacks slowed from ~5–11 ms to
+  ~115–123 ms with seven frames in flight and zero native encoder drops.
+  On m2-b, 4K60 + 1080p60 synthetic ISOs, 1080p60 program and a 6 Mb/s
+  local RTMP stream reproduced this: native EncodeFrame blocked with only
+  seven outstanding submissions (six at return), never reaching our check
+  for eight. Its mixed A/V tap filled and exhausted the compositor's
+  32-frame pool, dropping program pictures and stream audio while ISOs
+  stayed clean. Checking seven instead also missed it; do not guess Apple's
+  internal window. `H264Encoder::encode` now publishes pressure when the
+  native call takes a frame period, as well as before our existing bounded
+  wait. A fast submission clears it. The first native picture is excluded:
+  its initialization exceeded the budget on an otherwise idle encoder,
+  costing 51 pictures per ISO in the review's light-load control (baseline
+  0). With the exclusion, three stream starts during one healthy recording
+  have zero video/audio losses, including the ISOs. No changes to #41's start gate,
+  split/finalization, queues, codec settings, or the admission controller.
+  Before that review fix, three interleaved six-take A/B pairs (30 s splits): baseline 18/18 bad
+  program takes, 16,882 program / 18,655 stream drops and 16,629 stream
+  audio dropouts; fixed 0/18 bad, zero protected video/audio losses. The
+  overloaded M2 now sheds ISO pictures as intended (26,734 total); six
+  recording-only split takes keep all three files loss-free. The final build
+  has **zero losses through 16 post-split takes**, but two first takes lose
+  9/12 program and stream pictures during cold stream startup. In the 9-drop
+  run all losses already existed at callbacks=0 / in_flight=1: the first
+  native submission can block beyond the pool's reserve before either
+  post-call signal can act. A baseline cold-start control also loses pictures
+  immediately (20 by the first sample) and keeps losing them. Do not claim
+  the requested zero-total-drop acceptance passed. After three investigated
+  variants, stop changing policy; next investigate isolating native warmup
+  from the full program tap instead of guessing another queue threshold.
+  M2-a/macOS 27 additionally verified four pre-review candidate takes with
+  pause/scene switches, zero protected losses. All **249 files**, including
+  failed qualification runs, passed ffprobe/full decode; final e2e 15/15,
+  workspace fmt/clippy/191 tests clean. Reviewer cleared the startup
+  regression; coordinator owns the remaining acceptance decision.
+  Evidence and limitations:
+  `/Volumes/IsocastBuild/split-drops/scratch/REPORT.md`.
+- 2026-10-15 (ui/fast-loop): **the layout loop runs on Slint's
+  interpreter, never the shipped app.** `--features live-slint` turns on
+  Slint 1.18.1's `live-preview`: the generated `AppWindow` becomes a typed
+  wrapper over slint-interpreter that compiles ui/app.slint (an absolute
+  path baked in at build time) when the app starts, so the Rust side
+  compiles unchanged. Default and release builds are untouched (same
+  pixels in all 15 visual-shots views; the optional crates aren't in
+  THIRD_PARTY_NOTICES). `--snapshot-watch` reloads in place through an
+  `AppWindow::live_reload()` that build.rs adds to the generated module
+  (Slint's own watcher needs an event loop the offscreen platform lacks).
+  The `ui-dev` profile (release + incremental, own folder) makes an
+  isocast-ui .rs edit ~3-4 s. Numbers: .slint edit -> PNG ~345 s before,
+  0.9 s watching / 1.4-3.3 s one-off now.
 
 - 2026-10-14 (Ryan): **reading OBS source is allowed; copying it isn't.**
   Agents may clone OBS Studio and its plugins outside the repo and read them
@@ -1583,6 +2428,25 @@ each section. Delete entries that stop being true.
   a Finder rename or a kill between the folder rename and the timeline
   writes heals itself. Export manifests are not healed after a Finder
   rename (they are rewritten only by `rename_project`).
+- 2026-10-15 (#51 permissions onboarding): the permissions step is area H
+  (src/areas/permissions.rs, ui/areas/permissions/), shown before Welcome
+  on the first launch, at launch when the live setup needs a missing
+  permission (once per run; Skip hides it until next launch), from
+  Settings › General › Review… and from a source's permission warning
+  (`Ui.menu("permissions")`). The first run's Permissions step draws the
+  same rows. Rows layout over three columns (compared in real snapshots):
+  statuses and actions line up in one lane, details get the full width.
+  Per-row actions: Allow… = `request_permissions` with one permission on a
+  connection of its own (the engine waits up to a minute; the window's
+  calls must not); Open Settings = the exact pane plus the floating
+  helper; Relaunch = `shutdown_if_idle` (the app itself never needs to
+  relaunch: isocastd is its own responsible process and the only one
+  holding the stale answer); Check for Updates… for a refusal without a
+  prompt. The helper is a native non-activating NSPanel (src/helper.rs)
+  placed by CGWindowListCopyWindowInfo (System Settings' pid, layer 0),
+  drawn as Console's floating surface with Mona Sans; it drags a file URL
+  of `app_path`. Radii follow theme.slint (sheets 12px), not design.md's
+  superseded 3px.
 
 - 2026-10-14 (8.2h fix round 1, review findings): **Trust and safety
   corrections.**
@@ -1653,12 +2517,12 @@ each section. Delete entries that stop being true.
   - *Embedding*: arm64-thinned, XPC services removed (only sandboxed apps
     use them), Autoupdate/Updater.app/framework signed with hardened runtime
     and no entitlements before the app (Sparkle's sandboxing guide's order).
-  - *Camera extension*: out of scope. The released Isocast.app doesn't
-    carry it (a separate, one-time `scripts/vcam-install.sh` install), so a
-    Sparkle update never replaces or deactivates it: the activated system
-    extension keeps its installed version, and installing a newer one stays
-    vcam-install.sh's job. If a later release changes the extension's
-    protocol, its release notes must say to run vcam-install.sh again.
+  - *Camera extension*: since #67 (2026-10-15) the released app carries
+    it in its engine helper. A Sparkle update replaces the embedded copy
+    but not the activated extension, which keeps its installed version
+    until something asks macOS to activate the new one (follow-up: compare
+    versions at Start and re-request activation). If a release changes the
+    extension's protocol, that follow-up must land first.
 - 2026-10-14 (Ryan): **exonbook's "'Python' is requesting to bypass the
   system private window picker" alert stays unanswered.** Ryan doesn't use
   exonbook and leaves it open; it blocks nothing (the engine is already
@@ -4398,7 +5262,98 @@ each section. Delete entries that stop being true.
   are intent-level (plan, apply, start, stop, switch scene, preview frame),
   not one tool per API call.
 
+- 2026-10-15 (#75, small-fixes): an ISO audio source with no sound (a media
+  file without an audio track) is skipped with a take-report warning naming
+  the field, not refused by validation: a media source may or may not have
+  audio, which is only known once its file is open. The skip is in
+  plan_take (record/mod.rs), the warning beside the other start warnings
+  (engine.rs); the writer is untouched.
+- 2026-10-15 (#74, small-fixes): obs-websocket without a password allows
+  only loopback binds (`WebsocketSettings::problem`, field `no_password`;
+  stored settings that break it keep the server off) and refuses upgrades
+  with an Origin header (403); at most 32 clients (503 beyond); Sleep
+  outside a batch answers 206 like OBS.
+- 2026-10-15 (#69, small-fixes): the camera extension's path fallback
+  accepts only `/Applications/<one name>.app/Contents/Helpers/Isocast
+  Engine.app/Contents/MacOS/isocastd` and `/Applications/Isocast Camera
+  Host.app/Contents/MacOS/isocastd` (`producerPathAllowed`).
+- 2026-10-15 (#49, small-fixes): `isocast mcp` checks for an older engine
+  once, on its first tool call, and warns on stderr; the app's
+  couldn't-restart warning stays until dismissed (OK).
+
 ## Gotchas
+
+- 2026-10-16 (#82): a third-party HAL driver that stops answering makes
+  every Core Audio call into it wait for coreaudiod's 60-150 s timeouts:
+  on Ryan's Mac, Studio Audio (com.ryanvogel.studiondi.audio, from his
+  Studio NDI app) stalled AVCaptureSession.startRunning 05:17:51-05:29:21
+  after a 7 h take and failed with 0x10000004 (MACH_SEND_TIMED_OUT); its
+  dealloc then blocked the main queue 90 s. The unified log shows it
+  (`log show --predicate 'processID == <isocastd> AND subsystem ==
+  "com.apple.coreaudio"'`: AUHAL `SelectDevice ... connecting device`
+  with minutes between lines). Repro without such a driver: in the test
+  VM, `sudo kill -STOP $(pgrep -x coreaudiod)` for under a minute, then
+  `-CONT` (scratch /Volumes/IsocastBuild/mic-timeout/scratch/vm/hang.sh).
+- 2026-10-16 (#70, e2e `edit`): the synthetic flash and beep follow the
+  engine's clock, not the take's: a second take's pulses can sit half a
+  second off the first's. Checks that cut at a chosen pulse phase must
+  measure each take's beep onsets first (e2e.py `scenario_edit` does).
+  The test pattern's bars scroll width / (4 s × fps) pixels per source
+  frame, so the bar edge in one decoded row names the source frame
+  (`pattern_frames`), and the label's fifth character tells BARS2 from
+  BARS.
+- 2026-10-16 (#83): TCC keys a Developer ID app's grants by its designated
+  requirement (identifier + team), never the helper's file name: on
+  isocast-m2-b an update-test app granted camera, microphone, screen and
+  system audio as build 1792300000 (engine `isocastd`) kept every
+  TCC.db row unchanged (same csreq and last_modified; the screen row's
+  last_modified moved only when I toggled it by hand in between) after
+  both a bundle swap and a Sparkle update to build 1792300100 (engine
+  `Isocast Engine`), with no prompt. The camera alert then said
+  "Isocast Engine" would like to use a new camera extension. Gotchas met on
+  the way: the test Mac's screen-recording `+` and the extension toggle ask
+  for the password in System Settings' own sheet (type with cua-driver's
+  desktop scope, not into SecurityAgent); ffmpeg's avfoundation input
+  rejects `-framerate 60` for the Isocast camera (use 240, the range's top).
+
+- 2026-10-16 (S.2 stress): Python's `sock.close()` doesn't close a
+  socket whose `makefile()` reader is still open, so the connection stays
+  up on the daemon's side (e2e.py's `Watch.close` does this). stress.py's
+  first clients run "leaked" 31 threads and 64 fds that were really its
+  own 32 open watch connections; close the reader too (stress.py
+  `hang_up`).
+- 2026-10-16 (S.2 stress): macOS caps Unix socket paths at 104 bytes; a
+  hw-batch job's work folder is ~90 bytes deep, so stress.py runs each
+  engine through a short `/tmp/isocast-stress-<pid>` link when needed.
+
+- 2026-10-16 (#4): Rust's `File::sync_all`/`sync_data` on macOS is
+  F_FULLFSYNC: 3.6 ms on Ryan's internal disk, ~14 ms on
+  /Volumes/IsocastBuild, per call. Keep it off anything a person or a
+  script waits on (a CLI command, a reply); `libc::fsync` is ~0.1 ms.
+  To time a CLI command, run several builds interleaved against one
+  isolated daemon: single runs vary by ~0.5 ms.
+- 2026-10-16 (#78): a sync offset of exactly two frames (33.31 ms at
+  60 fps) in an e2e file is a source picture arriving late, not a muxing
+  bug: the program takes each source's newest frame at draw time and never
+  waits, while audio is stamped by sample. Read the burnt-in `FRAME`/`T+`
+  label around the flash (`crop=1000:290:0:0`): a repeated frame then a
+  jump is a late source. The replay scenario's evidence keeps every media
+  clock's `wake_max_us`/`late_wakes` and the compositor's `reused` count.
+  At the default QoS a generator thread in the background-only daemon woke
+  up to 104 ms late with *no* load (CPU load with 8× `yes` made it better,
+  14-26 ms), so loading the CPU doesn't reproduce it; repeated idle runs do
+  (2/15 on m2-b).
+- 2026-10-16: **A new remote-build lane can inherit another lane's crates.**
+  Its target is an APFS clone of the last-used lane's and sync keeps
+  mtimes, so a crate this branch doesn't touch but the other lane changed
+  (here isocast-protocol, from a vcam branch) counted as fresh and the
+  build failed on a variant main doesn't have. Touching every crate source
+  once fixed it: `git ls-files 'crates/*.rs' 'crates/*.slint' | grep -v
+  libvpx | xargs touch` (a full rebuild, ~8 min on an M2).
+- 2026-10-16: **Offscreen `press:LABEL` fails in a run's first snapshot**
+  ("no element named …") for elements of a dialog opened by a state in the
+  same snapshot; put a plain snapshot of that state first (the later
+  snapshots in the run find it).
 
 - 2026-10-15: Linux builds, and records synthetic sources in-process
   (`isocast record`, L.1) and in the daemon (`isocast start`, L.2). The
@@ -4478,6 +5433,329 @@ each section. Delete entries that stop being true.
   through deeper Send/Sync checks than the default allows.
 - 2026-10-15 (L.1): the CLI's panic hook keeps panic messages out of the
   terminal; read them in `~/.isocast/logs/*.jsonl` (component `panic`).
+
+- 2026-10-15 (#64): a media source doesn't advance while nothing records
+  or streams: `snapshot` on an idle engine shows the clip's first frame
+  every time. Start a recording before snapshotting media. Snapshots of a
+  playing alpha clip compared with ffmpeg's composite sometimes match no
+  single reference frame (31-46 dB on both VP8 and VP9, while others are
+  exact or 48-52 dB); take several.
+- 2026-10-16 (#76): `flock` on an NFS mount with `-o nolocks` fails with
+  ENOTSUP (45); Rust's `try_lock` reports it as `TryLockError::Error`
+  ("lock acquisition failed due to I/O error"), not `WouldBlock`. Before
+  #76 that refused every crash-safe take there as "already being written
+  by another recorder". A lockless share to test on: on an M2 test Mac,
+  `/etc/exports` with `/Users/Shared/csf-nfs -mapall=501:20 -network
+  127.0.0.0 -mask 255.0.0.0`, `sudo nfsd start`, `sudo mount -t nfs -o
+  nolocks,vers=3 localhost:/Users/Shared/csf-nfs DIR`. Repair at launch
+  needs the folder's exclusive lock, so a take killed there stays
+  "recording" with its fragmented (playable) files; kill-matrix can't run
+  with --work on exFAT or NFS (the daemon's Unix socket can't live there).
+- 2026-10-15 (#33): Process taps need their own TCC grant (System Audio
+  Recording Only) even where screen recording is granted; an engine
+  with screen recording but no decision blocks in
+  `AudioDeviceCreateIOProcID` on the prompt. A copied /usr/bin/afplay is
+  SIGKILLed (platform binary signature); `codesign -f -s -` the copy.
+  On the M2s the tap and the aggregate's input stream report 48 kHz even
+  with the speakers set to 44.1 kHz (the HAL drift-compensates; beep
+  stamps then jitter ±3 ms instead of 0), so the resampler path (rate ≠
+  48 kHz) has only its unit test so far. afplay itself goes silent for
+  ~1 s when the default output changes (SCK records the same gap).
+  `tccutil reset AudioCapture dev.isocast.isocastd` brings back "not
+  asked" on a test Mac. A private aggregate device is visible to its own
+  process as an AVFoundation microphone (filtered by its UID prefix
+  `dev.isocast.tap.`). The test VM's "Apple Virtual Sound Device" has
+  inputs and outputs, but a daemon started over SSH there can't play
+  (afplay: AudioQueueStart 89) or write files (-12903), so audio checks
+  need the M2s.
+- 2026-10-15 (#73): **check a received FLV's A/V sync from the audio's
+  first packet time.** e2e's `pcm()` numbers decoded samples from 0, but an
+  FLV has no edit list and its audio starts a few ms (up to ~50 ms on an
+  M2) after the first picture, so beep/flash "offsets" of 0.7–49 ms that
+  vary per run are that start, not drift. Adding the first audio packet's
+  pts gives <= 0.4 ms on every destination, before and after a reconnect.
+  (The lane's scratch ms.py does this; e2e's stream scenario doesn't run
+  `sync_check` on the FLV, so e2e isn't affected.)
+- 2026-10-15 (#70): **A new remote-build lane can build stale sources.**
+  Its target is an APFS clone of another lane's, whose artifacts can be
+  newer than files this branch changed long ago (sync keeps mtimes), so
+  cargo skipped isocast-protocol and reported "no `TimelineTrimParams` in
+  `timeline`" for files that were right there. Touching the branch's own
+  files before the first build on a new lane or host fixed it:
+  `git diff --name-only --diff-filter=d "$(git merge-base main HEAD)" |
+  xargs touch` (against `main` itself, once main has moved on, touch
+  creates empty files for main's new paths).
+
+- 2026-10-15 (#70): **`hw-batch.py … cmd --gui` jobs must finish within
+  10 minutes**: `testmac.sh gui` gives up on the desktop bridge after 10
+  minutes, and the runner then deletes the job's folder and frees the lock
+  while the job still runs there (a 30-minute recording kept going into a
+  deleted folder until killed). Do long work in an SSH `cmd` job, keep its
+  output outside the job folder, then a short `--gui` job for the window.
+
+- 2026-10-15 (#70): **A passthrough AVAssetWriterInput takes samples with
+  another format description** (VideoToolbox's re-encoded keyframe
+  interval between copied ones): it writes a new sample description, in
+  .mov and .mp4, H.264 and HEVC, and FFmpeg decodes across them with no
+  errors. FFmpeg then attaches new-extradata side data to the first packet
+  after each switch, which adds a column to `-f framemd5` lines: compare
+  the hash column by name, not "the last column" (7 copied keyframes
+  looked new that way). Also decode with `-fps_mode passthrough` when
+  matching frames by index: an export of a 30 fps ISO whose parts start on
+  the 60 fps grid probes as r=60, and FFmpeg's default duplicates frames to
+  that.
+
+- 2026-10-15 (#59, fixes-005): `stream stop` drops `state.stream`, but a
+  stream that *failed* stays in the status until the next start, and its
+  own status hard-codes `key_set: true` (engine stream/mod.rs). `status`
+  now takes service, server, key_set and key_problem from the live setup
+  once the stream isn't active. Test it with a failed start (nothing
+  listening), not a stop. Keychain writes on a test Mac must go through
+  the bridge (`testmac-bridge.sh queue`): over SSH the login keychain is
+  locked.
+- 2026-10-15 (#71): **obs-websocket-js uses MessagePack by default under
+  Node** (`import 'obs-websocket-js'` resolves to the msgpack build; JSON
+  is `obs-websocket-js/json`), so a JSON-only server fails its handshake
+  with HTTP 400. Typed clients (obws/obs-cmd, goobs, Streamer.bot) refuse
+  `2326.0` where OBS sends integers (durations, bytes), and expect
+  responses the docs omit: ToggleRecordPause returns `outputPaused`
+  (checked every mapped handler in obs-websocket's source; that is the
+  only one). Level meters (InputVolumeMeters) flow only while the live
+  engine runs. An unsigned rebuild of isocastd can't read the Keychain
+  password the previous build stored (as with stream keys): the server
+  stays off and says to set it again; tests use ISOCAST_WEBSOCKET_PASSWORD.
+
+- 2026-10-15 (#3 integration): **A direct VT encoder's first keyframe is
+  not the end of startup.** With a 4K program and 4K/1080p/1080p ISOs,
+  three M4 starts kept every frame on main but the crash-safe writer
+  refused 3/3/2 ISO frames at 0.217–0.250 s. Refusal-only traces showed
+  queue 4, native in-flight 8, newest encoded PTS 0: its startup backlog
+  flag had cleared too early. Keep the bounded 32-picture startup queue
+  until two encoded pictures return and pending is below 4. Afterward
+  all three starts are loss-free; the shared 25 ms first-picture gate and
+  the steady ISO admission policy are unchanged. Never use a heavy VT
+  property-query interposer to qualify losses: it perturbed both builds
+  substantially. Also, create movie files exclusively before locking;
+  truncate-then-lock destroys an existing file even when the lock fails.
+
+- 2026-10-14 (G.3b fix round 1, from the adversarial review): a muxer that
+  writes a picture's duration before it knows the next picture's time
+  silently removes every gap that falls on a fragment boundary; the
+  reviewer's SIGSTOP stalls produced 0.6–1.0 s of A/V drift in finished
+  files that decoded cleanly. Hold the newest picture until its successor
+  arrives, and rebuild the final table from the sample times. "Decodes
+  without errors" never certifies timing: compare `mdhd`, `stts`, the
+  edit, ffprobe's packet end and AVFoundation's decoded end.
+- 2026-10-14 (G.3b fix round 1): `File::sync_data()` is `fcntl(F_FULLFSYNC)`
+  on Apple platforms (Rust std), so there is no "plain fsync" to choose
+  from Rust and a `fsync` interposer does not see it; trace `fcntl` op 51.
+- 2026-10-14 (G.3b fix round 1): a 16-byte `pwrite` can tear under a
+  kill (a test interposer wrote 8 bytes and stopped); a recovery that
+  trusts a header's own bytes then strands intact data. Validate against
+  what follows (the header must end exactly on a complete `moov`).
+- 2026-10-14 (G.3b fix round 1): AVAssetReader fails a track whose edit
+  presents media it does not have (an audio track with zero packets and a
+  33 ms edit): leave such a track out, and present only available media.
+- 2026-10-14 (G.3b fix round 2): adding a method with a default body to a
+  trait silently leaves every delegating wrapper (`MacWriter`'s enum
+  dispatch) on the default: the re-review's VideoToolbox drop interposer
+  showed `lost_frames` never reaching the engine. Delegate every method,
+  and check new accounting end to end with an injected event, not by
+  reading the code.
+- 2026-10-14 (G.3b fix round 2): a header patch can tear after *any*
+  byte; a recognizer that accepts two exact prefixes (the review's 8
+  bytes) still strands 4–7. Decide from the structures behind the
+  reserved area, never from the area's own bytes, and test every length.
+- 2026-10-14 (G.3b fix round 2): a folder lock does not protect an inode
+  reachable through another folder (a symlink or hard link staged in a
+  failed manifest's folder). Repair must open through its own directory
+  with `openat(O_NOFOLLOW)`, refuse `st_nlink > 1`, and keep that
+  descriptor; `OpenOptions::open` by path follows links.
+- 2026-10-14 (G.3b fix round 3): `rename` keeps `st_nlink == 1`, so a
+  live movie moved into another folder passed every alias check; the
+  recorder now `flock`s its movie while writing and repair try-locks.
+  A movie "as long as its last picture" hides audio saved after it, and
+  with no picture at all presents nothing although ffmpeg read a second
+  of sound from the raw file: size the movie by its longest kept track.
+  Identify own files by an exact `ftyp` (with a private brand), never by
+  layout: a foreign fragmented MP4 with a 16-byte box after its 28-byte
+  `ftyp` got the header patch at the wrong offset and stopped opening.
+- 2026-10-14 (G.3b lane): a shared `CARGO_TARGET_DIR` between two source
+  trees (main's archive and the worktree) lets `cargo build -p …` link a
+  crate against the *other* tree's rlib of the same name when feature
+  unification differs between invocations ("struct `LiveFile` has no
+  field named `committed_seconds`" although the source has it). `cargo
+  clean --release -p` the workspace crates and rebuild; copy each build's
+  daemon away immediately, since the next tree's build overwrites
+  `target/release/isocastd`.
+- 2026-10-14 (G.3b lane): a QuickTime `mp4a` track with an edit list that
+  skips the AAC priming needs the `roll` sample group (`sgpd`/`sbgp`, roll
+  distance -1) AVAssetWriter writes: without it AVAssetReader (what
+  join.rs and editors use) starts the audio at the first whole packet
+  after the edit, 64 ms late; ffmpeg decodes from packet 0 either way.
+- 2026-10-14 (G.3b lane): AVAssetReader without output settings reports
+  a few more video "samples" than the track's frame count (244 for 240
+  frames of AVAssetWriter's own file, 249 for 245 of ours); compare frame
+  counts with ffprobe `-count_frames`, not AVAssetReader sample counts.
+- 2026-10-15 (#68, iso-overshed, BLOCKED): **Estimated spare capacity is
+  not proof that stream pressure is false.** On exonbook/M4 Max, synthetic
+  4K60 + 1080p60 HEVC ISOs, 1080p60 program and 6 Mb/s 1080p60 stream:
+  stream-first is loss-free; record-first loses 1,973/1,971 ISO pictures in
+  a 181 s stream window and 2,024/2,021 across six 30 s split takes, with
+  protected outputs clean. Disabling only #60's post-call pressure produces
+  0 ISO drops but 5,523 program / 6,058 stream drops over 181 s; three split
+  takes then lose 883 / 897 / 0 program pictures. Native placement/start order
+  is the leading hypothesis (#41), not measured engine assignment. Do not
+  dismiss those calls as harmless based on the capacity estimate. Traces
+  confirm rising pressure edges bypass the controller's 100 ms cut limit;
+  recovery is per guard (usually two), not process-wide. An eight-call
+  capped-average signal worsened M4 long ISO losses to 5,906 each; limiting
+  cuts to 100 ms and recovering +5%/500 ms improved short starts but worsened
+  long/split runs (3,100/3,099 and 4,946/4,940). Both candidates and temporary
+  traces were removed. M2-b fitting 1080p60 ISO + program + 720p60 stream is
+  already loss-free on main for 6 s, 181 s and six split takes; heavy runs
+  retain the known 11–14 startup protected losses but zero post-split losses.
+  Stop tuning constants: next measure native engine placement/throughput for
+  the two start orders. Evidence, per-take counts and full decodes:
+  `/Volumes/IsocastBuild/iso-overshed/scratch/REPORT.md`. #68 is not resolved.
+
+- 2026-10-15 (#18): **AAC in a .mov for AVFoundation** needs QuickTime's
+  version 1 sound description (compression id -2, 1024 samples per packet)
+  with the `esds` inside a `wave` atom (`frma`, `mp4a`, `esds`,
+  terminator); version 0 with a bare `esds` (fine for ffmpeg) fails to open
+  with -11829/-12848. And without an `sgpd`/`sbgp` `roll` of -1 on the
+  audio track AVFoundation drops ~600 samples of the edit list's start
+  (its audio came out 13 ms short of the video). Check muxed files with
+  AVAssetReader, not only ffprobe.
+- 2026-10-15 (#66): **ISO files can drop with a stream on even when the
+  encoders have room.** On the M5 Max (load 0.47 by the table) a 6 s take of
+  a 4K60 + 1080p60 ISO, 1080p60 program and a local stream dropped ~69% of
+  ISO frames (program and stream whole): the stream encoder's pressure
+  (#60) cut the ISO share and it recovers at +1%/500 ms. On m2-b the same
+  takes without a stream were clean and the predicted-fitting fix with the
+  stream was clean, so the M2 numbers stand, but the overload notice says
+  "the encoders fell behind, though this setup should fit" rather than
+  blaming capacity when the table says it fits. Worth a look by whoever
+  owns the admission controller.
+- 2026-10-15 (#66): **remote-build lanes seeded from another lane can
+  reuse that lane's crates.** A new lane's target is an APFS clone of the
+  last-used lane's; cargo judges freshness by mtime, so a checkout whose
+  files are older than that lane's last build (a fresh `git worktree add`
+  of an older commit) compiled against the other lane's protocol (a base
+  build of main failed on this branch's `EstimateCapacity`). Fix used:
+  `ISOCAST_LANE=<lane> scripts/remote-build.sh cargo clean --release -p
+  <every workspace crate>` once, then build.
+
+- 2026-10-15 (#58): System Settings' sheets (the password prompt, "Quit &
+  Reopen") are separate layer-0 windows of its pid, in front of the main
+  window; pick its largest window to find the main one. Over ssh on
+  isocast-m2-b, TCC reads camera and microphone as denied for every app
+  (not "not determined"), so no request is made there at all.
+
+- 2026-10-15 (#46): `scripts/remote-build.sh` on a new lane clones the
+  most recent lane's target and keeps local mtimes, so crates edited
+  before that lane's last build look up to date and the build fails with
+  "no `optimize` in isocast_protocol" (or worse, links stale code).
+  `git diff --name-only main...HEAD | grep '\.rs$' | xargs touch` before
+  the first remote build of a lane fixes it.
+- 2026-10-15 (#46): over SSH a test Mac's login keychain is locked, so
+  moving a stream key fails (-25293); `scripts/testmac.sh gui` works.
+  Don't read the item with `security find-generic-password -w` there: it
+  prompts (the item belongs to isocastd) and blocks.
+- 2026-10-15 (#46): test Macs have no `timeout` (coreutils); bound remote
+  scripts with the local `timeout` around testmac.sh instead.
+- 2026-10-15 (#46): a speed-test key that is a common word ("test") makes
+  the redactor blank that word everywhere in messages; use an odd key in
+  ISOCAST_STREAM_KEY for local tests.
+- 2026-10-15 (#61, WebM/MKV): Apple's Opus AudioConverter drops the
+  first 120 samples it decodes (2.5 ms; macOS 27.2) and reports no
+  PrimeInfo, so applying the full OpusHead pre-skip put sound 2.5 ms
+  early. The reader decodes the first packet alone on a throwaway
+  converter and subtracts what's missing from the pre-skip;
+  AudioConverterReset does NOT bring the drop back (a reset converter
+  measured 120 and then played 120 late), so playback uses a fresh one.
+  AAC's magic cookie must be an ES descriptor (esds) around the
+  AudioSpecificConfig: the raw ASC from CodecPrivate is rejected with
+  '!dat'. VideoToolbox has no VP8 decoder; VP9 profile 1 (4:4:4) fails
+  with -12910; AV1 needs VTIsHardwareDecodeSupported (M3+; true on the M5
+  Max). A VP9-alpha 1080p stinger costs ~130 MB more RSS than its ProRes
+  4444 twin (two hardware VP9 sessions' surfaces, BGRA output), flat over
+  time.
+- 2026-10-15 (#57): macOS 27 asks "Allow “Isocast Engine” to find devices
+  on local networks?" (UserNotificationCenter alert) on the engine's first
+  .local lookup even without NSLocalNetworkUsageDescription; while it's
+  unanswered getaddrinfo blocks (stream stays "connecting"), after Don't
+  Allow the lookup fails ("nodename nor servname"). The Mac's own LAN
+  address is not restricted, so a one-machine test can only show the
+  .local half; the AWS test Macs can't reach another LAN host. The switch
+  is "Isocast Engine" in Privacy & Security → Local Network (cua-driver
+  sees it as AXCheckBox "Isocast Engine_Toggle").
+- 2026-10-15 (#63): Keychain items a Developer ID engine creates trust it
+  by designated requirement (path recorded, not checked): a copy at
+  another path and another build with the same requirement read it
+  silently. Deleting a same-team item works; a different signer's
+  (e.g. `security add-generic-password`) can't be deleted (-25244). Once,
+  a 0.0.3-saved item failed to read from the fixed build (ignored as
+  designed); two repeats moved fine. `isocast status --json` prints only
+  state and files; the stream's key_set is in the `status` RPC.
+
+- 2026-10-14 (motion harness, fix round 3): a gain computed as an
+  unaligned regression drops for a late edge (0.79 at 14 frames) and
+  must never gate the lag; use travel over travel. A SIGKILLed motion.sh
+  leaves its isocast-ui --motion child running (parent 1, no lock), and
+  it would relaunch the engine: the marker records UI pids for recovery.
+  Shell redirection and write_text follow symlinks: publish outputs by
+  writing a temp file and renaming it.
+
+- 2026-10-14 (motion harness, fix round 2): a lock made of mkdir + a
+  pid file has a window where the pid isn't written yet and a second run
+  "reclaims" it; hold an flock on an inherited fd instead (python3 -c
+  'fcntl.flock(9, …)' on the shell's fd 9 keeps the lock with the
+  shell's open file) and close fd 9 for children, or a detached engine
+  keeps it. A script started as a background job of a non-interactive
+  shell inherits SIGINT ignored and can't trap it (POSIX), so it runs to
+  the end on Ctrl-C to its group: test signal cleanup from a foreground
+  or new-session launch.
+
+- 2026-10-14 (motion harness, review fix round): `isocast engine stop`
+  only lets isocastd idle, and the CLI launches it detached (parent
+  launchd, no socket path in its argv), so `pkill -f "$work"` never ends
+  it: shut it down over its socket and TERM/KILL what `lsof -a -c
+  isocastd -t +D "$work"` still lists (without `-c isocastd` the script's
+  own shell matches, through its open files, and kills itself). Things
+  that made "identical" lockstep runs draw different pixels: the work
+  folder's path in the status bar (use a fixed folder), setup revisions
+  (the engine numbers them from the clock), the engine's CPU and the
+  recording disk's free space in status replies, the picture during a
+  preview resize (the engine draws at the size asked for when the window
+  was last drawn; wait for that exact fitted size), and replies vs events
+  racing on their two connections.
+
+- 2026-10-14 (motion harness): Slint's TouchArea `mouse-x` is relative to
+  where the area is now; a splitter that moves with the drag and sizes
+  itself from `mouse-x - pressed-x` settles at half the pointer's distance
+  (#24). Window recordings: 4:2:0 video can't be cropped to an odd height
+  (ffmpeg fails quietly in a pipe), and levels come out shifted
+  (#242424 on #121212 → #141414 on #080808): find lines by contrast. The
+  real app needs ISOCAST_UI_PREFS per test run, or a drag's layout carries
+  into the next run. CGWindowList shows isocast-ui's windows with owner
+  `isocast-ui` and an empty title without Screen Recording.
+- 2026-10-15 (ui/fast-loop): under the interpreter (`live-slint`) the
+  window's `init` ran before the Rust side hid the in-window menu bar and
+  `changed height` never fired after, so `Viewport` was 40 points short
+  (docks 229 instead of 240). offscreen.rs resizes there and back after
+  show and after every reload (`live_resize`); keep that if the menu bar
+  or Viewport logic changes. The interpreter also logs "The use of the
+  ElementHandle API requires … debug info" for each of ~2000 internal
+  items on every element search (`--crop`, `press:`); the offscreen
+  platform drops that line, as printing it made a reload 3.8 s instead
+  of 0.9 s. Watch reloads keep properties, models and callbacks the Rust
+  side set, so dialogs, menus, recording carry over; hover does not.
+  `--state stream:live` before `wait:` is undone by the daemon's next
+  stream status (compiled builds too): put `stream:` after the wait.
+  visual-shots pictures include the disk's free space, so render base
+  and head back to back or unrelated text shows as changed.
+
 - 2026-10-14 (#47 fix round): building a `git archive` of main into the
   same CARGO_TARGET_DIR (for "before" screenshots) left main's
   isocast-protocol/diagnostics artifacts in place; the branch then failed
@@ -4497,6 +5775,41 @@ each section. Delete entries that stop being true.
 - 2026-10-14 (7.7): SBPL rules are last-match-wins; `regex` filters take a
   POSIX regex in `#"..."` (no `"` possible), so the recordings root is
   regex-escaped and a root with a quote gets no write rule.
+- 2026-10-15 (#51): macOS 27 attributes every privacy permission of the
+  bundled engine to the outer Isocast.app (tccd log: "executable path
+  …/Isocast Engine.app/Contents/MacOS/isocastd resolves to attributed
+  bundle: …/Isocast.app/", team ids matched), for screen recording too, so
+  System Settings lists "Isocast" and the helper drags Isocast.app. A
+  first reading on m2-a looked like screen recording went to the engine's
+  own bundle; that was the dev app's TCC entry for the shared
+  dev.isocast.isocastd id. tccd's reasons: `sudo log show --predicate
+  'subsystem == "com.apple.TCC"' --info` (BUNDLE_ATTRIBUTION lines).
+- 2026-10-15 (#51): any grant made in System Settings while isocastd
+  runs reaches only processes started afterwards: screen recording ("may
+  not be able to record … until it is quit") and also camera and
+  microphone turned on after Don't Allow ("will not have access … until
+  it is quit"; isocast-m2-b, macOS 26.7). macOS's Quit & Reopen quits
+  only the UI, never isocastd. A child that inherits isocastd's
+  responsibility inherits the stale answer too: the
+  `--preflight-permissions` child disclaims responsibility and exits with
+  a bit per permission it lacks; any it has and the engine doesn't gets
+  action `restart`.
+- 2026-10-15 (#51): an app without the camera/audio-input entitlement
+  (0.0.2) gets its media request answered "denied" in a few ms with no
+  prompt; the engine marks requests refused within 600 ms
+  `denied_without_prompt` (reproduced with an ad-hoc copy of the release
+  app on m2-a). `tccutil reset` needs the bundle registered first
+  (`lsregister -f`), else "No such bundle identifier".
+- 2026-10-15 (#51): on isocast-m2-a, cua-driver's desktop `drag` performs
+  a real drag into System Settings' privacy list (it asks for the admin
+  password, typed with desktop `press_key` per character; `type_text`
+  can't reach the auth sheet), and Finder windows cover the dock. Resetting
+  dev.isocast.isocastd there also resets the shared dev app's grants;
+  after the #51 run camera, microphone and screen recording were granted
+  to Isocast Dev again (same certificate, so every worktree's dev app).
+  If it held Input Monitoring or Accessibility before (hotkey tests), those
+  were reset too and not restored: grant them again if a hotkey run on
+  m2-a says so.
 
 - 2026-10-14 (8.2h): Slint's macOS menu bar (muda) rebuilds the whole
   application menu whenever a tracked property changes, so an NSMenuItem
@@ -6027,6 +7340,22 @@ each section. Delete entries that stop being true.
   video flashes, when checking sync with the tone.
 - 2026-10-11: objc2 0.3 renamed many C functions to methods (for example
   `CMClock::host_time_clock().time()`); the free functions are deprecated.
+
+- 2026-10-15: README screenshots (scripts/screenshots/take.sh): take them on
+  isocast-m2-b, not exonbook. On exonbook display-mode.swift has no HiDPI
+  mode, the app window comes out 1440x867, and Finder's sidebar shows
+  Ryan's favourites. On m2-b the first run builds Isocast.app there
+  (ui-dev.sh --release) for more than 10 minutes, so `testmac.sh gui` gives
+  up ("no answer from the desktop-session bridge") while remote.sh carries
+  on: wait for it, then `scp 'isocast-m2-b:isocast-scratch/docs-shots/out/*.png'`
+  and run take.sh's trim step by hand. Hold /Volumes/IsocastBuild/.bench.lock
+  (`lockf`) so the hardware queue doesn't start on it meanwhile. Since
+  recordings go into project folders, shoot.sh opens the take's project
+  folder itself. Dialogs that need a fake OBS folder (the first-launch
+  sheet) or a benchmark (the Optimize summary) are drawn offscreen with
+  scripts/snapshot.sh: `ISOCAST_OBS_FOLDER=… --state wizard-first-launch`,
+  and `--state wizard:goal --state wizard-sample:OPTIMIZED.json` (the
+  sample needs the wizard open first).
 
 ## Verification recipes
 

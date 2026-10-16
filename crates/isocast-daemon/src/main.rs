@@ -30,15 +30,16 @@ use isocast_engine::record::{
     RecordOptions, SessionControl, SharedEvent, SharedFeed, SplitTake, SplitTiming, expand_home,
     interrupted_note, interrupted_sessions,
 };
-use isocast_engine::stream::{KEY_ENV, KEY_SERVICE, OnChange, Stream};
+use isocast_engine::stream::{KEY_ENV, LEGACY_KEY_SERVICE, OnChange, Stream};
 use isocast_protocol::api::InitParams;
 use isocast_protocol::api::{
-    Applied, ApplyParams, EngineInfo, EngineState, Event, EventKind, EventKinds, Frame,
-    FrameParams, FrameRate, FrameStream, FramesParams, GetParams, ImportObsParams, Live,
-    LiveStatus, Marked, Method, Notification, Plan, Refreshed, Report, Request, Resolved, Response,
-    RpcError, SharedFrameStream, SharedFramesParams, Snapshot, SnapshotParams, StartParams,
-    Started, Status, StreamKey, StreamKeyParams, StreamKeyTarget, Switched, TakeCause, TuneParams,
-    Tuning, WatchParams, lock_path, shared, socket_path,
+    Applied, ApplyParams, CapacityEstimate, CapacityParams, EngineInfo, EngineState, Event,
+    EventKind, EventKinds, Frame, FrameParams, FrameRate, FrameStream, FramesParams, GetParams,
+    ImportObsParams, Live, LiveStatus, Marked, Method, Notification, Overload, OverloadedFile,
+    Plan, Refreshed, Report, Request, Resolved, Response, RpcError, SharedFrameStream,
+    SharedFramesParams, Snapshot, SnapshotParams, StartParams, Started, Status, StreamKey,
+    StreamKeyParams, StreamKeyTarget, Switched, TakeCause, TuneParams, Tuning, WatchParams,
+    lock_path, shared, socket_path,
 };
 use isocast_protocol::change::{Change, diff, merge_patch, missing_removals};
 use isocast_protocol::devices::{PermissionKind, PermissionsReport};
@@ -46,7 +47,7 @@ use isocast_protocol::init::{self, Initialized};
 use isocast_protocol::manifest::SessionManifest;
 use isocast_protocol::obs::{self, Imported};
 use isocast_protocol::stream::{
-    STREAM_SERVICES, StreamService, StreamSettings, StreamState, StreamStatus, key_account,
+    MAIN_DESTINATION, STREAM_SERVICES, StreamService, StreamSettings, key_account,
 };
 use isocast_protocol::{Canvas, Issue, PROGRAM, Setup, SourceKind, Transition};
 use isocast_surfaces::{Exporter, Surface, Token};
@@ -91,15 +92,20 @@ use isocast_platform_macos::MacPlatform as Native;
 mod data;
 mod debug;
 mod diagnostics;
+mod edit;
 mod export;
 mod hotkeys;
 mod library;
+mod optimize;
 mod plugins;
 mod projects;
 mod recovery;
+mod replay;
 mod store;
+mod streams;
 mod timeline;
 mod virtual_camera;
+mod websocket;
 
 fn main() -> ExitCode {
     if isocast_diagnostics::native::requested() {
@@ -108,6 +114,10 @@ fn main() -> ExitCode {
         } else {
             ExitCode::FAILURE
         };
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(code) = isocast_platform_macos::preflight_permissions() {
+        return ExitCode::from(code);
     }
     #[cfg(target_os = "macos")]
     if let Some(mode) = std::env::args().nth(1) {
@@ -131,8 +141,11 @@ fn main() -> ExitCode {
             isocast_platform_macos::run_main_queue(|| std::process::exit(0));
         }
         let result = match mode.as_str() {
-            "--install-camera-extension" => Some(virtual_camera::activate()),
+            "--install-camera-extension" => Some(virtual_camera::activate(
+                std::env::args().nth(2).as_deref() == Some("--wait-for-approval"),
+            )),
             "--uninstall-camera-extension" => Some(virtual_camera::deactivate()),
+            "--camera-extension-state" => Some(virtual_camera::print_state()),
             "--list-virtual-camera" => Some(virtual_camera::camera_probe(false)),
             "--check-virtual-camera" => Some(virtual_camera::camera_probe(true)),
             _ => None,
@@ -155,6 +168,7 @@ fn main() -> ExitCode {
             diagnostics::start(&daemon);
             daemon.load_timelines();
             start_plugins(&daemon);
+            daemon.websocket.load(&daemon);
             let saver = daemon.clone();
             thread::spawn(move || saver.contain("setup saver", || saver.save_live_changes()));
             // On Ctrl-C, SIGTERM or SIGHUP, finish the files before exiting.
@@ -664,8 +678,7 @@ fn watch(
     writer.set_write_timeout(Some(WATCH_WRITE_TIMEOUT))?;
     let (tx, rx) = mpsc::sync_channel(WATCH_QUEUE_DEPTH);
     let wanted = params.wanted();
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let key = NEXT.fetch_add(1, Ordering::Relaxed);
+    let key = next_watcher_key();
     daemon
         .watchers
         .lock()
@@ -737,6 +750,12 @@ fn hung_up(stream: &UnixStream) -> bool {
                 std::io::Error::last_os_error().kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
             ))
+}
+
+/// A key for a new [`Watcher`], unique in this process.
+fn next_watcher_key() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A connection watching events, and the kinds it wants.
@@ -819,6 +838,8 @@ struct Daemon {
     /// an export, the virtual camera); `shutdown_if_idle` write-holds it,
     /// so no start can slip between its idle check and the shutdown.
     starting: std::sync::RwLock<()>,
+    /// The obs-websocket compatibility server (`websocket_*`).
+    websocket: websocket::Runtime,
 }
 
 /// isocastd's processor use, as `status` reports it: the share of all the
@@ -874,6 +895,8 @@ fn process_cpu_seconds() -> Option<f64> {
 #[derive(Default)]
 struct State {
     camera: virtual_camera::CameraOutput,
+    /// The replay buffer, running or the last (for its final status).
+    replay: replay::ReplayOutput,
     /// The recording, if one runs (on the live engine).
     session: Option<Session>,
     /// The live engine, while something needs it.
@@ -906,27 +929,19 @@ struct State {
     /// Where the live setup is kept between runs: the current scene
     /// collection and profile.
     file: store::Store,
-    /// The stream, running or ended (kept for its final status).
-    stream: Option<Stream>,
-    /// `stream_start` calls getting the engine ready for a stream that
-    /// isn't in `stream` yet; the engine mustn't idle out under them.
+    /// Each stream destination's stream, running or ended (kept for its
+    /// final status), by destination id, the main one first.
+    streams: Vec<(String, streams::Output)>,
+    /// `stream_start` calls getting the engine ready for streams that
+    /// aren't in `streams` yet; the engine mustn't idle out under them.
     streams_starting: u32,
-    /// Stream frames dropped already warned about.
-    stream_drops_reported: u64,
-    stream_audio_drops_reported: u64,
-    stream_bitrate_warned: bool,
+    /// Stream losses already warned about, per destination.
+    stream_reported: streams::ReportedMap,
     /// Temporary push-key overrides, never persisted.
     hotkey_holds: HashMap<String, (String, bool)>,
 }
 
 impl State {
-    /// A stream is running (or reconnecting), so the engine is needed.
-    fn streaming(&self) -> bool {
-        self.stream
-            .as_ref()
-            .is_some_and(|stream| stream.status().is_active())
-    }
-
     /// Scene ids of the live setup.
     fn scene_ids(&self) -> Vec<String> {
         self.setup
@@ -1016,12 +1031,25 @@ trait LiveEngine: Send + Sync {
     fn resolved(&self) -> Option<Resolved>;
     /// Why the canvas can't change to `canvas` now, if it can't.
     fn canvas_refusal(&self, canvas: &Canvas) -> Option<String>;
-    /// Stream the program with `settings` under `key`.
-    fn stream(&self, settings: StreamSettings, key: String, on_change: OnChange) -> Result<Stream>;
+    /// Stream the program with `settings` under `key`, as destination `id`.
+    fn stream(
+        &self,
+        id: &str,
+        settings: StreamSettings,
+        key: String,
+        on_change: OnChange,
+    ) -> Result<Stream>;
     fn virtual_camera(
         &self,
         on_change: isocast_engine::record::OnCameraChange,
     ) -> Result<isocast_engine::record::VirtualCamera>;
+    /// Keep the program in a replay buffer.
+    fn replay(
+        &self,
+        settings: &isocast_protocol::replay::ReplaySettings,
+        stream: Option<&StreamSettings>,
+        on_change: isocast_engine::replay::OnChange,
+    ) -> Result<isocast_engine::replay::ReplayBuffer>;
     fn stop(&self);
 }
 
@@ -1085,12 +1113,27 @@ impl<P: Platform<SharedSurface = Surface>> LiveEngine for LiveEngineOf<P> {
         LiveEngineOf::canvas_refusal(self, canvas)
     }
 
-    fn stream(&self, settings: StreamSettings, key: String, on_change: OnChange) -> Result<Stream> {
-        isocast_engine::stream::start(self, settings, key, on_change)
+    fn stream(
+        &self,
+        id: &str,
+        settings: StreamSettings,
+        key: String,
+        on_change: OnChange,
+    ) -> Result<Stream> {
+        isocast_engine::stream::start(self, id, settings, key, on_change)
     }
 
     fn stop(&self) {
         LiveEngineOf::stop(self);
+    }
+
+    fn replay(
+        &self,
+        settings: &isocast_protocol::replay::ReplaySettings,
+        stream: Option<&StreamSettings>,
+        on_change: isocast_engine::replay::OnChange,
+    ) -> Result<isocast_engine::replay::ReplayBuffer> {
+        isocast_engine::replay::start(self, settings, stream, on_change)
     }
 
     fn virtual_camera(
@@ -1169,11 +1212,14 @@ impl Daemon {
                 );
             }
         }
-        let _ = self.stream_stop();
+        let _ = self.stream_stop(Default::default());
         self.stop_export("isocastd was stopped (restarted or quit) during the export");
         self.stop_engine();
         self.flush_live_save();
         self.data.flush();
+        // After the recording's end went out: OBS clients hear ExitStarted
+        // and a close, not a dropped socket.
+        self.websocket.stop();
         self.plugins.stop_all();
         let _ = std::fs::remove_file(socket_path());
         isocast_diagnostics::clean_exit();
@@ -1193,7 +1239,7 @@ impl Daemon {
             self.shutting_down.store(false, Ordering::SeqCst);
             return Err(RpcError {
                 code: RpcError::WRONG_STATE,
-                message: format!("isocastd is {busy}, so it keeps running"),
+                message: format!("isocastd keeps running while {busy}"),
             });
         }
         Ok(())
@@ -1207,7 +1253,7 @@ impl Daemon {
                 "recording; stop it first (`isocast stop`, or MCP's stop_recording)".into(),
             );
         }
-        if stream_status(&state).is_some_and(|stream| stream.is_active()) {
+        if state.streaming() {
             return Some(
                 "streaming; stop it first (`isocast stream stop`, or MCP's stop_stream)".into(),
             );
@@ -1215,6 +1261,13 @@ impl Daemon {
         if state.camera.active() {
             return Some(
                 "feeding the virtual camera (a call may be using it); stop it first (`isocast vcam stop`, or MCP's virtual_camera_stop)".into(),
+            );
+        }
+        if state.replay.active() {
+            return Some(
+                "keeping a replay buffer; save it if needed, then stop it (`isocast replay stop`, \
+                 or MCP's stop_replay)"
+                    .into(),
             );
         }
         if state.tuning {
@@ -1236,11 +1289,12 @@ impl Daemon {
         let _starting = matches!(
             request.method,
             Method::Start(_)
-                | Method::StreamStart
+                | Method::StreamStart(_)
                 | Method::TimelineExport(_)
                 | Method::VirtualCameraStart
+                | Method::ReplayStart
                 | Method::Resume
-                | Method::Tune(_)
+                | Method::Optimize(_)
         )
         .then(|| self.starting.read().unwrap_or_else(|e| e.into_inner()));
         if self.shutting_down.load(Ordering::SeqCst)
@@ -1300,12 +1354,19 @@ impl Daemon {
             }),
             Method::Engine { running } => self.hold_engine(running).and_then(to_json),
             Method::Permissions => permissions().map_err(failed).and_then(to_json),
-            Method::RequestPermissions => request_permissions().map_err(failed).and_then(to_json),
+            Method::RequestPermissions(params) => {
+                request_permissions(params.and_then(|p| p.permission))
+                    .map_err(failed)
+                    .and_then(to_json)
+            }
             Method::OpenPermissionSettings { permission } => open_permission_settings(permission)
                 .map(|url| isocast_protocol::api::Opened { url })
                 .map_err(failed)
                 .and_then(to_json),
             Method::ImportObs(params) => import_obs(*params).and_then(to_json),
+            Method::ObsDiscover(params) => self.obs_discover(params).and_then(to_json),
+            Method::SpeedTest(params) => self.speed_test(*params).and_then(to_json),
+            Method::Optimize(params) => self.optimize(*params).and_then(to_json),
             Method::InitSetup(params) => self.init_setup(*params).and_then(to_json),
             Method::Doctor(params) => check_folder(params.folder.as_deref()).and_then(|()| {
                 let setup = params
@@ -1329,11 +1390,35 @@ impl Daemon {
                 message: "watch must be the first request on its connection".into(),
             }),
             Method::Start(params) => self.start(*params).and_then(to_json),
-            Method::StreamStart => self.stream_start().and_then(to_json),
-            Method::StreamStop => self.stream_stop().and_then(to_json),
+            Method::StreamStart(params) => self
+                .stream_start(params.unwrap_or_default())
+                .and_then(to_json),
+            Method::StreamStop(params) => self
+                .stream_stop(params.unwrap_or_default())
+                .and_then(to_json),
+            Method::StreamDestinationAdd(params) => {
+                self.stream_destination_add(*params).and_then(to_json)
+            }
+            Method::StreamDestinationRemove { id } => {
+                self.stream_destination_remove(id).and_then(to_json)
+            }
+            Method::StreamDestinationSet(params) => {
+                self.stream_destination_set(*params).and_then(to_json)
+            }
             Method::VirtualCameraStart => self.virtual_camera_start().and_then(to_json),
             Method::VirtualCameraStop => to_json(self.virtual_camera_stop()),
             Method::VirtualCameraStatus => to_json(self.virtual_camera_status()),
+            Method::VirtualCameraRemove => self.virtual_camera_remove().and_then(to_json),
+            Method::ReplayStart => self.replay_start().and_then(to_json),
+            Method::ReplayStop => self.replay_stop().and_then(to_json),
+            Method::ReplaySave => self.replay_save().and_then(to_json),
+            Method::ReplayStatus => to_json(self.replay_status()),
+            Method::WebsocketStatus => to_json(self.websocket.status()),
+            Method::WebsocketEnable(params) => self
+                .websocket
+                .enable(self, params.unwrap_or_default())
+                .and_then(to_json),
+            Method::WebsocketDisable => self.websocket.disable().and_then(to_json),
             Method::StreamKeySet(params) => self.stream_key_set(*params).and_then(to_json),
             Method::StreamKeyClear(target) => self.stream_key_clear(*target).and_then(to_json),
             Method::Library => to_json(self.library()),
@@ -1393,6 +1478,18 @@ impl Daemon {
             Method::TimelineExport(params) => self
                 .timeline_export(params.unwrap_or_default())
                 .and_then(to_json),
+            Method::TimelineTrim(params) => self.timeline_trim(params).and_then(to_json),
+            Method::TimelineSplit(params) => self.timeline_split(params).and_then(to_json),
+            Method::TimelineDeleteRange(params) => {
+                self.timeline_delete_range(params).and_then(to_json)
+            }
+            Method::TimelineAngle(params) => self.timeline_angle(params).and_then(to_json),
+            Method::TimelineUndo(target) => self
+                .timeline_step(target.unwrap_or_default(), false)
+                .and_then(to_json),
+            Method::TimelineRedo(target) => self
+                .timeline_step(target.unwrap_or_default(), true)
+                .and_then(to_json),
             Method::HotkeysGet => to_json(self.hotkeys_get()),
             Method::HotkeysSet(params) => self.hotkeys_set(*params).and_then(to_json),
             Method::HotkeysActions => to_json(isocast_protocol::hotkeys::catalogue()),
@@ -1405,6 +1502,7 @@ impl Daemon {
             Method::DebugSet(params) => debug::set(self, params).and_then(to_json),
             Method::ListProjects(params) => to_json(self.list_projects(params.unwrap_or_default())),
             Method::RenameProject(params) => self.rename_project(params).and_then(to_json),
+            Method::EstimateCapacity(params) => self.estimate_capacity(*params).and_then(to_json),
             Method::Stop | Method::Shutdown => match self.stop() {
                 // Shutting down while idle is fine.
                 Err(err) if shutdown && err.code == RpcError::WRONG_STATE => {
@@ -1422,6 +1520,8 @@ impl Daemon {
     fn publish(&self, event: Event) {
         if matches!(event, Event::SetupChanged { .. }) {
             self.refresh_hotkeys();
+            // `recording.folder` may name a new recordings folder.
+            self.plugins.refresh_sandboxes();
             debug::sync(self, "setup changed");
         }
         diagnostics::event(&event);
@@ -1814,6 +1914,16 @@ impl Daemon {
         };
         // Kept beside the setup file, for `start` to check against.
         let memory = capacity::memory_path(state.file.legacy());
+        // Not under the `starting` gate (a benchmark takes minutes, and a
+        // restart would wait for it rather than be refused, #45): checked
+        // under the state lock instead, which `shutdown_if_idle` takes
+        // after setting `shutting_down`, so one of the two sees the other.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(RpcError {
+                code: RpcError::WRONG_STATE,
+                message: "the daemon is shutting down; tune once it has restarted".into(),
+            });
+        }
         state.tuning = true;
         drop(state);
         // Recording stays blocked until `tuning` clears, so clear it even if
@@ -2015,12 +2125,16 @@ impl Daemon {
         {
             return Err(wrong(reason));
         }
-        let recording = control.pause_status(now()).expect("recording clock");
+        let mut recording = control.pause_status(now()).expect("recording clock");
         let project = state
             .session
             .as_ref()
             .and_then(|s| s.project.as_ref().map(|p| p.id.clone()));
         drop(state);
+        if paused && let Some((recoverable, errors)) = control.pause_outcome(generation) {
+            recording.recoverable_seconds = recoverable;
+            recording.errors = errors;
+        }
         self.publish(Event::RecordingPaused {
             recording: recording.clone(),
             project,
@@ -2338,6 +2452,7 @@ impl Daemon {
             collection,
             profile,
             stream: stream_status(&state),
+            streams: streams::stream_statuses(&state),
             cpu_percent: self.cpu.lock().unwrap().read(),
             data: Some(self.data.status()),
             diagnostics: Some(isocast_diagnostics::health()),
@@ -2354,6 +2469,7 @@ impl Daemon {
                 .map(str::to_string),
             export: self.export_running(),
             virtual_camera: Some(state.camera.status_for(state.setup.as_ref())),
+            replay: Some(state.replay.status_for(state.setup.as_ref())),
             recording_free_bytes: None,
             program_bytes_per_second: state
                 .setup
@@ -2366,136 +2482,6 @@ impl Daemon {
         drop(state);
         status.recording_free_bytes = folder.as_deref().and_then(free_bytes);
         status
-    }
-
-    /// Start streaming the live engine's program to the live setup's
-    /// `[stream]` service, starting the engine if needed.
-    fn stream_start(self: &Arc<Self>) -> Result<StreamStatus, RpcError> {
-        let wrong = |message: String| RpcError {
-            code: RpcError::WRONG_STATE,
-            message,
-        };
-        let mut state = self.state.lock().unwrap();
-        if state.streaming() {
-            return Err(wrong(
-                "already streaming; stop it first (`isocast stream stop`, or MCP's stop_stream)"
-                    .to_string(),
-            ));
-        }
-        let settings = stream_settings(&state).ok_or_else(|| {
-            wrong(
-                "the live setup has no stream; add one (for example the patch \
-                 {\"stream\": {\"service\": \"twitch\"}} with `isocast apply --patch` or MCP's \
-                 apply_change), then set the key (`isocast stream key set`, or MCP's \
-                 set_stream_key)"
-                    .to_string(),
-            )
-        })?;
-        settings
-            .server()
-            .map_err(|err| failed(anyhow::anyhow!("{err}")))?;
-        let account = settings.key_account();
-        let key = match std::env::var(KEY_ENV) {
-            Ok(key) if !key.trim().is_empty() => key.trim().to_string(),
-            _ => match secret(KEY_SERVICE, &account) {
-                Ok(Some(key)) => key,
-                Ok(None) => {
-                    return Err(failed(anyhow::anyhow!(
-                        "no stream key is set for {}; run `isocast stream key set` (it reads the \
-                         key from stdin), or MCP's set_stream_key",
-                        key_label(settings.service, &account)
-                    )));
-                }
-                Err(err) => return Err(failed(err)),
-            },
-        };
-        isocast_diagnostics::redact::remember_secret(KEY_SERVICE, &account, &key);
-        // Starting the engine happens outside the lock; until the stream is
-        // in the state, this keeps the engine from idling out.
-        state.streams_starting += 1;
-        drop(state);
-        let engine = self.ensure_engine();
-        let mut state = self.state.lock().unwrap();
-        state.streams_starting -= 1;
-        let engine = engine?;
-        if state.streaming() {
-            return Err(wrong(
-                "already streaming; stop it first (`isocast stream stop`, or MCP's stop_stream)"
-                    .to_string(),
-            ));
-        }
-        // The previous stream, finished, makes way.
-        state.stream = None;
-        state.stream_drops_reported = 0;
-        state.stream_audio_drops_reported = 0;
-        state.stream_bitrate_warned = false;
-        let daemon = Arc::downgrade(self);
-        let on_change: OnChange = Box::new(move |status| {
-            if let Some(daemon) = daemon.upgrade() {
-                daemon.publish(Event::Stream {
-                    stream: status.clone(),
-                });
-            }
-        });
-        let stream = engine.stream(settings, key, on_change).map_err(failed)?;
-        // In the state while it connects, so the engine stays up for it,
-        // a second start is refused and `stream stop` can cancel it.
-        state.stream = Some(stream);
-        drop(state);
-        let deadline = std::time::Instant::now() + STREAM_START_TIMEOUT;
-        let status = loop {
-            let Some(status) = self
-                .state
-                .lock()
-                .unwrap()
-                .stream
-                .as_ref()
-                .map(Stream::status)
-            else {
-                return Err(failed(anyhow::anyhow!(
-                    "the stream was stopped before it went live"
-                )));
-            };
-            if status.state != StreamState::Connecting || std::time::Instant::now() >= deadline {
-                break status;
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        match status.state {
-            StreamState::Failed | StreamState::Offline => Err(failed(anyhow::anyhow!(
-                "{}",
-                status
-                    .last_error
-                    .unwrap_or_else(|| "the stream stopped".into())
-            ))),
-            _ => Ok(status),
-        }
-    }
-    fn stream_stop(&self) -> Result<StreamStatus, RpcError> {
-        let mut state = self.state.lock().unwrap();
-        let status = state.stream.as_ref().map(Stream::status);
-        if !status.as_ref().is_some_and(StreamStatus::is_active) {
-            // A stream that failed stays in the status until the next
-            // start; say so rather than only "not streaming".
-            let message = match status {
-                Some(StreamStatus {
-                    state: StreamState::Failed,
-                    last_error,
-                    ..
-                }) => format!(
-                    "not streaming: the stream already failed ({})",
-                    last_error.as_deref().unwrap_or("no reason given")
-                ),
-                _ => "not streaming".into(),
-            };
-            return Err(RpcError {
-                code: RpcError::WRONG_STATE,
-                message,
-            });
-        }
-        let stream = state.stream.take().expect("checked");
-        drop(state);
-        Ok(stream.stop())
     }
 
     fn stream_key_set(&self, params: StreamKeyParams) -> Result<StreamKey, RpcError> {
@@ -2512,9 +2498,10 @@ impl Daemon {
             )));
         }
         let (service, account) = self.key_target(params.target)?;
-        set_secret(KEY_SERVICE, &account, key).map_err(failed)?;
+        set_secret(key_service(), &account, key).map_err(failed)?;
+        retire_legacy_key(&account);
         forget_key_problem();
-        isocast_diagnostics::redact::remember_secret(KEY_SERVICE, &account, key);
+        isocast_diagnostics::redact::remember_secret(key_service(), &account, key);
         Ok(StreamKey {
             service,
             account,
@@ -2524,7 +2511,8 @@ impl Daemon {
 
     fn stream_key_clear(&self, target: StreamKeyTarget) -> Result<StreamKey, RpcError> {
         let (service, account) = self.key_target(target)?;
-        delete_secret(KEY_SERVICE, &account).map_err(failed)?;
+        delete_secret(key_service(), &account).map_err(failed)?;
+        retire_legacy_key(&account);
         forget_key_problem();
         Ok(StreamKey {
             service,
@@ -2537,6 +2525,57 @@ impl Daemon {
     /// the live setup's `[stream]`.
     fn key_target(&self, target: StreamKeyTarget) -> Result<(StreamService, String), RpcError> {
         let live = stream_settings(&self.state.lock().unwrap());
+        if let Some(id) = &target.destination {
+            // A destination not applied yet (Settings' draft) names its
+            // service (and custom server) itself.
+            if let Some(service) = target.service {
+                if id != MAIN_DESTINATION
+                    && (id.is_empty()
+                        || !id
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+                {
+                    return Err(failed(anyhow::anyhow!(
+                        "destination: {id:?} must use lowercase letters, digits and dashes"
+                    )));
+                }
+                if service == StreamService::Custom {
+                    let Some(server) = &target.server else {
+                        return Err(failed(anyhow::anyhow!(
+                            "a custom service's key belongs to its server; give the server \
+                             (like rtmp://host/app)"
+                        )));
+                    };
+                    isocast_protocol::stream::ServerUrl::parse(server)
+                        .map_err(|err| failed(anyhow::anyhow!("server: {err}")))?;
+                }
+                let server = target
+                    .server
+                    .as_deref()
+                    .filter(|_| service == StreamService::Custom);
+                return Ok((
+                    service,
+                    isocast_protocol::stream::destination_key_account(id, service, server),
+                ));
+            }
+            if target.server.is_some() {
+                return Err(failed(anyhow::anyhow!(
+                    "server: give it with the destination's service, or leave both out"
+                )));
+            }
+            let Some(settings) = &live else {
+                return Err(failed(anyhow::anyhow!(
+                    "destination: the live setup has no stream destinations"
+                )));
+            };
+            let Some(destination) = settings.destination(id) else {
+                return Err(failed(anyhow::anyhow!(
+                    "destination: no destination {id:?}; destinations: {}",
+                    settings.destination_ids().join(", ")
+                )));
+            };
+            return Ok((destination.settings.service, destination.key_account));
+        }
         let service = match (target.service, &live) {
             (Some(service), _) => service,
             (None, Some(settings)) => settings.service,
@@ -2573,52 +2612,6 @@ impl Daemon {
                 .map_err(|err| failed(anyhow::anyhow!("server: {err}")))?;
         }
         Ok((service, key_account(service, server.as_deref())))
-    }
-
-    /// Warn about stream-only losses and sustained bitrate overshoot (once
-    /// per episode), checked every second even when encoding/sending stalls.
-    fn warn_stream_drops(&self) {
-        let mut state = self.state.lock().unwrap();
-        let Some(status) = state.stream.as_ref().map(Stream::status) else {
-            return;
-        };
-        // While reconnecting, the stream's state events say why frames go.
-        if status.state != StreamState::Live {
-            state.stream_drops_reported = status.dropped_frames;
-            state.stream_audio_drops_reported = status.audio_dropouts;
-            state.stream_bitrate_warned = false;
-            return;
-        }
-        let mut warnings = Vec::new();
-        if status.dropped_frames > state.stream_drops_reported {
-            let new = status.dropped_frames - state.stream_drops_reported;
-            state.stream_drops_reported = status.dropped_frames;
-            warnings.push(format!(
-                "the stream dropped {new} frame(s) ({} so far, congestion {:.0}%); the \
-                     program and recordings are unaffected",
-                status.dropped_frames,
-                status.congestion * 100.0
-            ));
-        }
-        if status.audio_dropouts > state.stream_audio_drops_reported {
-            let new = status.audio_dropouts - state.stream_audio_drops_reported;
-            state.stream_audio_drops_reported = status.audio_dropouts;
-            warnings.push(format!(
-                "the stream dropped {new} audio chunk(s) ({} so far); \
-                 the stream encoder or connection could not keep up",
-                status.audio_dropouts,
-            ));
-        }
-        if let Some(warning) = &status.bitrate_warning
-            && !state.stream_bitrate_warned
-        {
-            warnings.push(warning.clone());
-        }
-        state.stream_bitrate_warned = status.bitrate_warning.is_some();
-        drop(state);
-        for message in warnings {
-            self.publish(Event::Warning { message });
-        }
     }
 
     fn start(self: &Arc<Self>, params: StartParams) -> Result<Started, RpcError> {
@@ -2803,6 +2796,11 @@ impl Daemon {
                 return Err(err);
             }
         };
+        // A plugin's sandbox lists the recordings folders as they were when
+        // it started: one used for the first time (made just now, maybe),
+        // or a folder named like a project made since, restarts it with
+        // them (#56).
+        self.plugins.refresh_sandboxes();
         // A folder made for a recording that wrote nothing goes again.
         let discard = |project: &projects::ProjectRef| {
             if project.created {
@@ -2864,11 +2862,14 @@ impl Daemon {
                 });
             };
             let reported = Mutex::new(Vec::<(u64, u64)>::new());
+            let overload = Mutex::new(OverloadWatch::default());
             let on_status = |status: &LiveStatus| {
                 *live.lock().unwrap() = Some(status.clone());
                 for message in status.new_drops(&mut reported.lock().unwrap()) {
                     daemon.publish(Event::Warning { message });
                 }
+                let take = takes.current.lock().unwrap().number;
+                daemon.note_overload(&overload, take, status);
                 daemon.publish(Event::Status {
                     live: status.clone(),
                 });
@@ -2951,23 +2952,225 @@ impl Daemon {
     }
 
     /// A warning if the recording that just started asks more of the
-    /// hardware encoders than `tune` measured they manage on this Mac.
+    /// hardware encoders than `tune` measured they manage on this Mac, or,
+    /// with nothing measured, than the chip's numbers say they manage.
     fn capacity_warning(&self, engine: &dyn LiveEngine) -> Option<String> {
         let (setup, memory) = {
             let state = self.state.lock().unwrap();
             let memory = capacity::memory_path(state.file.legacy());
             (state.setup.clone()?, memory)
         };
-        if !memory.exists() {
+        if memory.exists() {
+            // The ISO sources are running by now, at the formats they record.
+            let info = engine.info();
+            let measured = capacity::workload(&setup, |id| {
+                let source = info.sources.iter().find(|s| s.source == id)?;
+                Some((source.width?, source.height?, source.fps?))
+            })
+            .and_then(|workload| capacity::start_warning(&memory, machine_key()?, &workload));
+            if measured.is_some() {
+                return measured;
+            }
+        }
+        // Else what the chip's numbers predict, with the stream if it runs
+        // (#66): only when it can't keep up, so a fitting setup never nags.
+        let streaming = self.state.lock().unwrap().streaming();
+        let estimate =
+            estimate_capacity(&setup, Some(engine), streaming, true, &memory, None).ok()?;
+        if estimate.capacity != isocast_protocol::api::Capacity::CannotKeepUp {
             return None;
         }
-        // The ISO sources are running by now, at the formats they record.
-        let info = engine.info();
-        let workload = capacity::workload(&setup, |id| {
-            let source = info.sources.iter().find(|s| s.source == id)?;
-            Some((source.width?, source.height?, source.fps?))
-        })?;
-        capacity::start_warning(&memory, machine_key()?, &workload)
+        let mut text = estimate.summary;
+        if let Some(fix) = estimate.suggestions.first() {
+            text.push_str(&format!("; to fit, {}", fix.description));
+            if let Some(change) = &fix.change {
+                text.push_str(&format!(
+                    " (isocast plan --patch '{change}', after this take)"
+                ));
+            }
+        }
+        Some(text)
+    }
+
+    /// `estimate_capacity`: whether a setup's files (the live setup's, at
+    /// its sources' live formats) fit this Mac's encoders, by per-chip data.
+    fn estimate_capacity(&self, params: CapacityParams) -> Result<CapacityEstimate, RpcError> {
+        let (setup, streaming, recording, engine, memory) = {
+            let state = self.state.lock().unwrap();
+            let live = params.setup.is_none();
+            let Some(setup) = params.setup.or_else(|| state.setup.clone()) else {
+                return Err(state.no_setup("no setup to judge (or give one)"));
+            };
+            let streaming = params.stream.unwrap_or(if live {
+                state.streaming()
+            } else {
+                setup.stream.is_some()
+            });
+            let recording = live && state.session.is_some();
+            let engine = state.engine.clone().filter(|_| live);
+            let memory = capacity::memory_path(state.file.legacy());
+            (setup, streaming, recording, engine, memory)
+        };
+        estimate_capacity(
+            &setup,
+            engine.as_deref(),
+            streaming,
+            recording,
+            &memory,
+            params.add_iso.as_deref(),
+        )
+        .map_err(|message| RpcError {
+            code: RpcError::INVALID_PARAMS,
+            message,
+        })
+    }
+
+    /// Once per take, when the take's files drop frames and the disk isn't
+    /// behind: the encoders are at capacity. Says which files drop, why,
+    /// and the live setup's fixes (#66).
+    fn note_overload(
+        self: &Arc<Self>,
+        watch: &Mutex<OverloadWatch>,
+        take: u32,
+        status: &LiveStatus,
+    ) {
+        let mut watch = watch.lock().unwrap();
+        if watch.take != take {
+            *watch = OverloadWatch {
+                take,
+                baseline: status
+                    .files
+                    .iter()
+                    .map(|f| (f.source.clone(), f.frames, f.dropped_frames))
+                    .collect(),
+                stream_baseline: None,
+                stream_now: watch.stream_now,
+                sent: false,
+            };
+        }
+        // The recording's own thread: never wait for the state lock (a
+        // busy request keeps the last reading instead).
+        let (stream_dropped, stream_sent) = match self.state.try_lock() {
+            Ok(state) => {
+                // The running stream's own counts (no Keychain look-up
+                // for the setup's key, as `stream_status` makes).
+                // Every destination's, added up (#73).
+                let now = state
+                    .streams
+                    .iter()
+                    .map(|(_, output)| output.status())
+                    .filter(|s| s.is_active())
+                    .fold((0, 0), |(d, f), s| {
+                        (d + s.dropped_frames, f + s.frames_sent)
+                    });
+                watch.stream_now = now;
+                now
+            }
+            Err(_) => watch.stream_now,
+        };
+        let stream_baseline = *watch
+            .stream_baseline
+            .get_or_insert((stream_dropped, stream_sent));
+        if watch.sent || status.paused {
+            return;
+        }
+        // A slow disk drops frames too, and has its own warning.
+        if status.disk.as_ref().is_some_and(|d| d.behind()) {
+            return;
+        }
+        let mut dropping: Vec<OverloadedFile> = Vec::new();
+        for file in &status.files {
+            let (frames0, dropped0) = watch
+                .baseline
+                .iter()
+                .find(|(s, ..)| *s == file.source)
+                .map_or((0, 0), |(_, f, d)| (*f, *d));
+            let dropped = file.dropped_frames.saturating_sub(dropped0);
+            let due = file.frames.saturating_sub(frames0) + dropped;
+            if overloaded(dropped, due) {
+                dropping.push(OverloadedFile {
+                    output: file.source.clone(),
+                    dropped_frames: dropped,
+                    percent: dropped as f64 * 100.0 / due.max(1) as f64,
+                });
+            }
+        }
+        // Only the take's files say the encoders are behind: the stream's
+        // count also holds frames a congested or reconnecting connection
+        // dropped, which have their own warnings. With a file dropping,
+        // the stream's drops are a detail.
+        if dropping.is_empty() {
+            return;
+        }
+        let stream_dropped = stream_dropped.saturating_sub(stream_baseline.0);
+        let stream_due = stream_sent.saturating_sub(stream_baseline.1) + stream_dropped;
+        if overloaded(stream_dropped, stream_due) {
+            dropping.push(OverloadedFile {
+                output: "stream".into(),
+                dropped_frames: stream_dropped,
+                percent: stream_dropped as f64 * 100.0 / stream_due.max(1) as f64,
+            });
+        }
+        watch.sent = true;
+        drop(watch);
+        // Off the recording's thread: probing sources can take a moment.
+        let daemon = self.clone();
+        let elapsed_seconds = status.elapsed_seconds;
+        thread::spawn(move || daemon.publish_overload(take, elapsed_seconds, dropping));
+    }
+
+    fn publish_overload(&self, take: u32, elapsed_seconds: f64, mut dropping: Vec<OverloadedFile>) {
+        dropping.sort_by(|a, b| b.percent.total_cmp(&a.percent));
+        // The program file only: the stream's drops may be the network's.
+        let protected_dropping = dropping.iter().any(|f| f.output == PROGRAM);
+        let estimate = self.estimate_capacity(CapacityParams::default()).ok();
+        let names: Vec<String> = dropping
+            .iter()
+            .map(|f| format!("{} ({:.0}%)", f.output, f.percent))
+            .collect();
+        let verb = if names.len() == 1 { "is" } else { "are" };
+        let at_capacity = estimate
+            .as_ref()
+            .is_none_or(|e| e.capacity != isocast_protocol::api::Capacity::Fits);
+        let mut reason = if at_capacity {
+            format!(
+                "this Mac's video encoders are at capacity, so {} {verb} dropping frames",
+                names.join(", ")
+            )
+        } else {
+            // By the chip's numbers these files fit: something else is
+            // using the encoders, or they fell behind for a while.
+            format!(
+                "the video encoders fell behind, so {} {verb} dropping frames, though this \
+                 Mac's encoders should keep up with these files (another app using them, or a \
+                 busy Mac, can do this)",
+                names.join(", ")
+            )
+        };
+        if !protected_dropping {
+            reason.push_str("; the program and stream are kept whole");
+        }
+        if let Some(fix) = estimate.as_ref().and_then(|e| e.suggestions.first()) {
+            reason.push_str(&format!("; to fit, {}", fix.description));
+            if fix.after_take {
+                reason.push_str(" (applies once this take ends)");
+            }
+        }
+        let workload_key = estimate
+            .as_ref()
+            .map(|e| e.workload_key.clone())
+            .unwrap_or_default();
+        self.publish(Event::EncoderOverload {
+            overload: Box::new(Overload {
+                take,
+                elapsed_seconds,
+                dropping,
+                protected_dropping,
+                reason,
+                estimate,
+                workload_key,
+            }),
+        });
     }
 
     /// The live engine, started with the live setup if it isn't running.
@@ -3023,9 +3226,7 @@ impl Daemon {
                         let why = message.clone();
                         thread::spawn(move || {
                             daemon.contain("failed program output", || {
-                                if let Some(stream) = &daemon.state.lock().unwrap().stream {
-                                    stream.fail(why);
-                                }
+                                daemon.fail_streams(&why);
                             })
                         });
                     }
@@ -3213,6 +3414,7 @@ impl Daemon {
     /// Stop the live engine (after the recording, if one runs).
     fn stop_engine(&self) {
         self.virtual_camera_stop();
+        let _ = self.replay_stop();
         let engine = self.state.lock().unwrap().engine.take();
         if let Some(engine) = engine {
             engine.stop();
@@ -3227,6 +3429,7 @@ impl Daemon {
             let mut state = self.state.lock().unwrap();
             let idle = state.session.is_none()
                 && !state.camera.active()
+                && !state.replay.active()
                 && !state.streaming()
                 && state.streams_starting == 0
                 && !state.hold
@@ -3247,6 +3450,7 @@ impl Daemon {
         loop {
             thread::sleep(Duration::from_secs(1));
             self.warn_stream_drops();
+            self.warn_replay_drops();
             self.stop_idle_engine_now();
         }
     }
@@ -3344,6 +3548,9 @@ fn engine_info(state: &State) -> Option<EngineInfo> {
     if state.camera.active() {
         info.outputs.push("virtual_camera".into());
     }
+    if state.replay.active() {
+        info.outputs.push("replay".into());
+    }
     Some(info)
 }
 
@@ -3392,50 +3599,38 @@ fn stream_settings(state: &State) -> Option<StreamSettings> {
     state.setup.as_ref().and_then(|setup| setup.stream.clone())
 }
 
-/// What `status` says about streaming: the stream's own status if one ran,
-/// else the live setup's stream, offline.
-fn stream_status(state: &State) -> Option<StreamStatus> {
-    if let Some(stream) = &state.stream {
-        return Some(stream.status());
-    }
-    let settings = stream_settings(state)?;
-    let from_env = std::env::var(KEY_ENV).is_ok_and(|key| !key.trim().is_empty());
-    let account = settings.key_account();
-    let key_set = from_env || has_secret(KEY_SERVICE, &account).unwrap_or(false);
-    let mut status = StreamStatus::offline(&settings, key_set);
-    if key_set && !from_env {
-        status.key_problem = key_problem(&account);
-    }
-    Some(status)
-}
+use streams::stream_status;
 
-/// What `key_problem` last found: the account, when, and the problem.
-static KEY_CHECKED: Mutex<Option<(String, std::time::Instant, Option<String>)>> = Mutex::new(None);
+/// When `key_problem` last asked about an account, and what it found.
+type KeyCheck = (std::time::Instant, Option<String>);
+
+/// What `key_problem` last found, per account.
+static KEY_CHECKED: Mutex<Option<HashMap<String, KeyCheck>>> = Mutex::new(None);
 
 /// Whether the stored key for `account` can be read without a prompt (a
 /// key stored by another build can't): why not, if not. Asked again at
 /// most every 10 s per account, and at once after a key is set or cleared.
 fn key_problem(account: &str) -> Option<String> {
     let mut checked = KEY_CHECKED.lock().unwrap();
-    if let Some((which, at, problem)) = checked.as_ref()
-        && which == account
+    let checked = checked.get_or_insert_with(HashMap::new);
+    if let Some((at, problem)) = checked.get(account)
         && at.elapsed() < Duration::from_secs(10)
     {
         return problem.clone();
     }
-    let problem = match secret(KEY_SERVICE, account) {
-        Err(err) if format!("{err:#}").contains("another build") => Some(
-            "The saved key was stored by another build of Isocast, which this one can't read \
-             without asking. Enter it again."
-                .to_string(),
-        ),
+    let problem = match secret(key_service(), account) {
+        Err(err) if format!("{err:#}").contains("another build") => Some(format!(
+            "The saved key was stored by a differently signed copy of this Isocast, and macOS \
+             lets only that copy use or replace it. Open Keychain Access, delete the “{}” item, \
+             then paste the key and press Save Key.",
+            key_service()
+        )),
         _ => None,
     };
-    *checked = Some((
+    checked.insert(
         account.to_string(),
-        std::time::Instant::now(),
-        problem.clone(),
-    ));
+        (std::time::Instant::now(), problem.clone()),
+    );
     problem
 }
 
@@ -3616,22 +3811,45 @@ fn plan(state: &State, change: Change, plugins: &plugins::Registry) -> Result<Pl
                 .into(),
         );
     }
+    if state.replay.active()
+        && changes.iter().any(|change| {
+            change.path.starts_with("recording.replay")
+                || change.path == "stream"
+                || change.path.starts_with("stream.")
+        })
+    {
+        notes.push(
+            "the replay buffer is running: it keeps its current format and length until it \
+             stops; the changes take effect at its next start (`isocast replay stop`, then \
+             `isocast replay start`)"
+                .into(),
+        );
+    }
     // A stream key pasted into stream.server is refused (a problem says
     // so), and the plan mustn't show it either.
-    if let Some(key) = setup
+    let pasted: Vec<String> = setup
         .as_ref()
         .and_then(|setup| setup.stream.as_ref())
-        .and_then(StreamSettings::pasted_key)
-    {
+        .map(|stream| {
+            stream
+                .resolve()
+                .iter()
+                .filter_map(|d| d.settings.pasted_key())
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in pasted {
         for change in &mut changes {
             for value in [&mut change.from, &mut change.to].into_iter().flatten() {
                 redact_value(value, &key);
             }
         }
-        if let Some(stream) = setup.as_mut().and_then(|setup| setup.stream.as_mut())
-            && let Some(server) = &mut stream.server
-        {
-            *server = isocast_engine::stream::redact(server, &key);
+        if let Some(stream) = setup.as_mut().and_then(|setup| setup.stream.as_mut()) {
+            let servers = std::iter::once(&mut stream.server)
+                .chain(stream.destinations.iter_mut().map(|d| &mut d.server));
+            for server in servers.flatten() {
+                *server = isocast_engine::stream::redact(server, &key);
+            }
         }
     }
     Ok(Plan {
@@ -3662,6 +3880,113 @@ fn now() -> Time {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn now() -> Time {
     Time::from_nanos(0)
+}
+
+/// The Keychain service this build keeps stream keys under:
+/// `<app bundle id>.stream` (`dev.isocast.release.stream` for Isocast.app),
+/// so each build owns its own items. One shared service let a key saved by
+/// the dev build block the release build, which may neither read nor
+/// replace it (#63).
+fn key_service() -> &'static str {
+    static SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SERVICE.get_or_init(|| match app_identifier() {
+        Some(id) => format!("{id}.stream"),
+        None => "dev.isocast.unbundled.stream".to_string(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn app_identifier() -> Option<String> {
+    isocast_platform_macos::app_identifier()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_identifier() -> Option<String> {
+    None
+}
+
+/// The stream key for `account`: this build's own, or one an older Isocast
+/// kept under the shared legacy service, moved here once if this build may
+/// read it without asking.
+fn stream_key(account: &str) -> Result<Option<String>> {
+    match secret(key_service(), account)? {
+        Some(key) => Ok(Some(key)),
+        None => Ok(migrate_legacy_key(account)),
+    }
+}
+
+/// Whether a key for `account` is stored for this build (moving a readable
+/// legacy one here first).
+fn has_stream_key(account: &str) -> Result<bool> {
+    Ok(has_secret(key_service(), account)? || migrate_legacy_key(account).is_some())
+}
+
+/// Accounts whose legacy item this build can't read: ignored, not asked
+/// about again until the daemon restarts.
+static LEGACY_IGNORED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Move the legacy item for `account` to this build's service when it can
+/// be read without a prompt, and remove it, so a key cleared later doesn't
+/// come back. One another build saved is ignored: the user saves the key
+/// again, under this build's own service.
+fn migrate_legacy_key(account: &str) -> Option<String> {
+    let mut ignored = LEGACY_IGNORED.lock().unwrap();
+    if ignored.iter().any(|a| a == account)
+        || key_service() == LEGACY_KEY_SERVICE
+        || !has_secret(LEGACY_KEY_SERVICE, account).unwrap_or(false)
+    {
+        return None;
+    }
+    let key = match secret(LEGACY_KEY_SERVICE, account) {
+        Ok(Some(key)) => key,
+        Ok(None) => return None,
+        Err(err) => {
+            isocast_diagnostics::diagnostic!(
+                "warn";
+                "isocastd: ignoring the stream key for {account} under the old Keychain service \
+                 {LEGACY_KEY_SERVICE}: {err:#}"
+            );
+            ignored.push(account.to_string());
+            return None;
+        }
+    };
+    if let Err(err) = set_secret(key_service(), account, &key) {
+        isocast_diagnostics::diagnostic!(
+            "warn";
+            "isocastd: could not move the stream key for {account} to the Keychain service {}: \
+             {err:#}",
+            key_service()
+        );
+        // Still usable this time; moving is tried again next time.
+        return Some(key);
+    }
+    isocast_diagnostics::diagnostic!(
+        "isocastd: moved the stream key for {account} from the Keychain service \
+         {LEGACY_KEY_SERVICE} to {}",
+        key_service()
+    );
+    drop(ignored);
+    retire_legacy_key(account);
+    Some(key)
+}
+
+/// Remove the legacy item for `account` if this build may (it saved it);
+/// one another build saved stays, ignored.
+fn retire_legacy_key(account: &str) {
+    if key_service() == LEGACY_KEY_SERVICE {
+        return;
+    }
+    if let Err(err) = delete_secret(LEGACY_KEY_SERVICE, account) {
+        isocast_diagnostics::diagnostic!(
+            "warn";
+            "isocastd: left the old Keychain item {LEGACY_KEY_SERVICE} for {account} alone: \
+             {err:#}"
+        );
+        let mut ignored = LEGACY_IGNORED.lock().unwrap();
+        if !ignored.iter().any(|a| a == account) {
+            ignored.push(account.to_string());
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3719,12 +4044,12 @@ fn permissions() -> Result<PermissionsReport> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn request_permissions() -> Result<PermissionsReport> {
-    Native.request_permissions()
+fn request_permissions(only: Option<PermissionKind>) -> Result<PermissionsReport> {
+    Native.request_permissions(only)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn request_permissions() -> Result<PermissionsReport> {
+fn request_permissions(_only: Option<PermissionKind>) -> Result<PermissionsReport> {
     bail!("permissions are only supported on macOS so far")
 }
 
@@ -3736,6 +4061,82 @@ fn open_permission_settings(permission: PermissionKind) -> Result<String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn open_permission_settings(_permission: PermissionKind) -> Result<String> {
     bail!("permissions are only supported on macOS so far")
+}
+
+/// A take's drop counts when it began, and whether its overload was said.
+#[derive(Default)]
+struct OverloadWatch {
+    take: u32,
+    /// (source, frames, dropped frames) as the take began.
+    baseline: Vec<(String, u64, u64)>,
+    /// The stream's (dropped, sent) as the take began, and at the last
+    /// reading.
+    stream_baseline: Option<(u64, u64)>,
+    stream_now: (u64, u64),
+    sent: bool,
+}
+
+/// Whether `dropped` of `due` pictures is an overload rather than a hiccup:
+/// at least a second's worth at 30 fps and 2% of them.
+fn overloaded(dropped: u64, due: u64) -> bool {
+    dropped >= 30 && dropped * 50 >= due
+}
+
+/// This Mac's chip and encoders.
+#[cfg(target_os = "macos")]
+fn this_machine() -> Option<&'static isocast_protocol::api::Machine> {
+    static MACHINE: std::sync::OnceLock<isocast_protocol::api::Machine> =
+        std::sync::OnceLock::new();
+    Some(MACHINE.get_or_init(|| MacPlatform.machine()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn this_machine() -> Option<&'static isocast_protocol::api::Machine> {
+    None
+}
+
+/// Estimate `setup`'s capacity: sources at their live formats in `engine`
+/// (if it runs this setup), else probed.
+fn estimate_capacity(
+    setup: &Setup,
+    engine: Option<&dyn LiveEngine>,
+    streaming: bool,
+    recording: bool,
+    memory: &Path,
+    add_iso: Option<&str>,
+) -> Result<CapacityEstimate, String> {
+    let Some(machine) = this_machine() else {
+        return Err("capacity estimates are only supported on macOS so far".into());
+    };
+    let live: HashMap<String, (u32, u32, u32)> = engine
+        .map(|engine| {
+            engine
+                .info()
+                .sources
+                .into_iter()
+                .filter_map(|s| Some((s.source, (s.width?, s.height?, s.fps?))))
+                .collect()
+        })
+        .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let probed =
+        isocast_engine::estimate::probed_formats(&MacPlatform, setup, &|id| live.contains_key(id));
+    #[cfg(not(target_os = "macos"))]
+    let probed: HashMap<String, (u32, u32, u32)> = HashMap::new();
+    let formats = |id: &str| live.get(id).or_else(|| probed.get(id)).copied();
+    let kept = capacity::Memory::load(memory);
+    let key = machine_key();
+    isocast_engine::estimate::estimate(
+        &isocast_engine::estimate::Inputs {
+            machine,
+            setup,
+            formats: &formats,
+            streaming,
+            memory: key.map(|key| (&kept, key)),
+            recording,
+        },
+        add_iso,
+    )
 }
 
 /// Which Mac (and macOS) `tune`'s measurements here hold for.

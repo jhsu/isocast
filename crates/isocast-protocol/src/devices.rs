@@ -17,6 +17,11 @@ pub struct Devices {
     /// (`audio.monitoring_device`).
     #[serde(default)]
     pub audio_outputs: Vec<AudioOutput>,
+    /// Apps that have opened audio, which `application_audio` sources
+    /// capture and `system_audio` sources can leave out (`exclude`). Those
+    /// playing now come first. Empty before macOS 14.2.
+    #[serde(default)]
+    pub audio_apps: Vec<AudioApp>,
     pub permissions: Permissions,
     /// Why parts of the list may be missing, and how to fix it.
     pub notes: Vec<String>,
@@ -47,6 +52,19 @@ pub struct Window {
     /// Size in points.
     pub width: u32,
     pub height: u32,
+}
+
+/// An app (or a command-line tool) that has opened audio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AudioApp {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    /// Valid only while the app runs. Setups match apps by name or bundle
+    /// id instead.
+    pub pid: u32,
+    /// It is playing sound now.
+    pub playing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -144,10 +162,16 @@ pub struct AudioOutput {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Permissions {
-    /// Needed for displays, windows and system audio.
+    /// Needed for displays and windows, and for system and app audio
+    /// before macOS 14.2 (or while `system_audio` isn't granted).
     pub screen_recording: Permission,
     pub camera: Permission,
     pub microphone: Permission,
+    /// System Audio Recording (macOS 14.2+): system and app audio through
+    /// Core Audio process taps, without screen recording. Reported as
+    /// granted where macOS has no such permission.
+    #[serde(default)]
+    pub system_audio: Permission,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -183,17 +207,25 @@ pub enum PermissionKind {
     ScreenRecording,
     Camera,
     Microphone,
+    /// System Audio Recording (macOS 14.2+).
+    SystemAudio,
 }
 
 impl PermissionKind {
-    pub const ALL: [PermissionKind; 3] = [Self::ScreenRecording, Self::Camera, Self::Microphone];
-    pub const NAMES: &[&str] = &["screen_recording", "camera", "microphone"];
+    pub const ALL: [PermissionKind; 4] = [
+        Self::ScreenRecording,
+        Self::Camera,
+        Self::Microphone,
+        Self::SystemAudio,
+    ];
+    pub const NAMES: &[&str] = &["screen_recording", "camera", "microphone", "system_audio"];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::ScreenRecording => "screen recording",
             Self::Camera => "camera",
             Self::Microphone => "microphone",
+            Self::SystemAudio => "system audio recording",
         }
     }
 }
@@ -204,6 +236,7 @@ impl Permissions {
             PermissionKind::ScreenRecording => self.screen_recording,
             PermissionKind::Camera => self.camera,
             PermissionKind::Microphone => self.microphone,
+            PermissionKind::SystemAudio => self.system_audio,
         }
     }
 }
@@ -217,7 +250,8 @@ pub struct PermissionsReport {
     pub permissions: Permissions,
     /// The app to turn on in System Settings, like "Isocast Dev".
     pub app: String,
-    /// Each permission in turn: screen recording, camera, microphone.
+    /// Each permission in turn: screen recording, camera, microphone,
+    /// system audio recording.
     pub details: Vec<PermissionDetail>,
 }
 
@@ -239,6 +273,19 @@ pub struct PermissionDetail {
     /// Granting it takes effect once isocastd restarts (`isocast restart`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub restart_after_granting: bool,
+    /// The app macOS lists this permission under in System Settings (the
+    /// one to turn on), like "Isocast"; it can differ by permission.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    /// That app's bundle, to drag into System Settings' list when it isn't
+    /// listed there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_path: Option<String>,
+    /// macOS refused it without showing its prompt (the app isn't allowed
+    /// to ask, as Isocast 0.0.2 wasn't for the camera): asking again won't
+    /// help; `next_step` says what will.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub denied_without_prompt: bool,
 }
 
 /// What to do about a permission.
@@ -253,4 +300,7 @@ pub enum PermissionAction {
     OpenSettings,
     /// A policy blocks it; only the Mac's administrator can change that.
     AskAdministrator,
+    /// It is granted in System Settings but takes effect only once
+    /// isocastd restarts (`isocast restart`, `shutdown_if_idle`).
+    Restart,
 }

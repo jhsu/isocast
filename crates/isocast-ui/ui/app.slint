@@ -38,9 +38,14 @@ import { LibraryArea } from "areas/library/state.slint";
 import { LibraryDialogs } from "areas/library/dialogs.slint";
 import { CreateArea } from "areas/create/state.slint";
 import { ClipBar } from "areas/create/clip-bar.slint";
+import { EditorView } from "areas/create/editor.slint";
 import { QuitDialog, QuitPrompt } from "quit.slint";
 import { DeveloperArea } from "areas/developer/state.slint";
 import { OverlaySize, StatsOverlay } from "areas/developer/overlay.slint";
+import { PermissionsArea } from "areas/permissions/state.slint";
+import { PermissionsSheet } from "areas/permissions/sheet.slint";
+import { WizardArea } from "areas/wizard/state.slint";
+import { WizardSheet } from "areas/wizard/sheet.slint";
 
 // What Rust sees: the globals and the structs in their models.
 export { Theme, Ui, ConnectionState, Menus, Toasts, EditCommands, SettingsForms }
@@ -48,12 +53,14 @@ export { CanvasArea, SourcesArea, MixerArea, ControlsArea, SettingsArea, Library
 export { CreateArea }
 export { DeveloperArea }
 export { StatRow, OutputStat } from "areas/developer/state.slint";
+export { PermissionsArea, PermissionItem } from "areas/permissions/state.slint";
+export { WizardArea, ObsCollectionRow, ChangeRow } from "areas/wizard/state.slint";
 export { QuitPrompt }
 export { DropdownOption, MenuEntry, MenuList, MenuEntryKind, NavTab, Segment, ToastData, ToastRow, ToastKind, FormField, FormGroup } from "kit.slint";
 export { SceneRow, ItemRow, FilterRow, PickRow } from "areas/sources/state.slint";
 export { Strip, Level, AudioRow } from "areas/mixer/state.slint";
 export { FileRow } from "areas/controls/state.slint";
-export { DeviceChoice, HotkeyGroup, HotkeyRow, IsoChoice, MicRow, PermissionRow, ReportFileRow, ServiceChoice } from "areas/settings/state.slint";
+export { DeviceChoice, HotkeyGroup, HotkeyRow, IsoChoice, IsoTrack, MicRow, ReportFileRow, ServiceChoice } from "areas/settings/state.slint";
 export { LibraryRow } from "areas/library/state.slint";
 export { ClipRow } from "areas/create/state.slint";
 
@@ -563,7 +570,8 @@ export component AppWindow inherits Window {
         }
         Menu {
             title: "Tools";
-            MenuItem { title: "Auto-Configuration Wizard…"; activated => { Ui.menu("start_over"); } }
+            MenuItem { title: "Auto-Configuration Wizard…"; activated => { Ui.menu("auto_config"); } }
+            MenuItem { title: "Set Up from This Mac…"; activated => { Ui.menu("start_over"); } }
         }
         // Developer mode (#47, src/areas/developer.rs): only while the
         // profile has it on.
@@ -585,6 +593,7 @@ export component AppWindow inherits Window {
             // again leaves full screen.
             MenuItem { title: "Enter Full Screen"; shortcut: @keys(Meta + Control + F); activated => { Ui.menu("fullscreen"); } }
             MenuSeparator { }
+            MenuItem { title: "Editor"; shortcut: @keys(Control + E); activated => { Ui.menu("editor"); } }
             MenuItem { title: "Bring All to Front"; activated => { Ui.menu("bring_all_to_front"); } }
         }
         Menu {
@@ -673,8 +682,11 @@ export component AppWindow inherits Window {
 
     // Over the window: Welcome (no setup yet), the dialogs, the gallery,
     // the menu and the toasts.
-    if Ui.loaded && !Ui.has-setup && !Ui.onboarding: Welcome { }
+    if Ui.loaded && !Ui.has-setup && !Ui.onboarding && !PermissionsArea.shown && !WizardArea.shown: Welcome { }
     if Ui.onboarding: Onboarding { }
+    // The setup wizard (area I): OBS's collections on the first launch,
+    // and Tools › Auto-Configuration Wizard….
+    if WizardArea.shown && !PermissionsArea.shown: WizardSheet { }
 
     SourcesDialogs { }
     MixerDialogs { }
@@ -683,6 +695,9 @@ export component AppWindow inherits Window {
         version: root.version;
     }
     LibraryDialogs { }
+    // The permissions step (area H), over Welcome, the first run and
+    // Settings, which open it.
+    if PermissionsArea.shown: PermissionsSheet { }
     QuitDialog { }
 
     if root.kit-gallery: KitGallery {
@@ -721,5 +736,65 @@ export component AppWindow inherits Window {
         width: root.test-pointer-width;
         height: root.test-pointer-height;
         background: #00ffff;
+    }
+}
+
+// The editor (C.3, #70): its own window, "Isocast Editor — <timeline>", so
+// the studio (scenes, sources, mixer, controls) is never changed or
+// crowded by it. The timeline with every ISO track, the preview of the
+// angle at the playhead, trims, splits, ripple deletes, angles and export.
+// It has its own globals: src/areas/create.rs fills its CreateArea as it
+// does the studio's.
+export component EditorWindow inherits Window {
+    title: CreateArea.has-timeline ? "Isocast Editor — " + CreateArea.timeline-name : "Isocast Editor";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 900px;
+    min-height: 480px;
+    background: Theme.surface-stage;
+    default-font-size: Theme.fs;
+    default-font-family: Theme.font-ui;
+    default-font-weight: Theme.weight-regular;
+    forward-focus: keys;
+
+    // S splits, I and O mark, Delete takes the marked span out (else the
+    // selected clip off), J K L play, arrows step a frame (⇧ ten), 1–9
+    // choose the angle, Escape clears the marks, ⌘Z and ⇧⌘Z undo and redo
+    // edits (Slint's Control is ⌘ on macOS).
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.modifiers.control && (event.text == "z" || event.text == "Z") {
+                if event.modifiers.shift {
+                    CreateArea.redo();
+                } else {
+                    CreateArea.undo();
+                }
+                return accept;
+            }
+            if event.modifiers.control || event.modifiers.meta || event.modifiers.alt {
+                return reject;
+            }
+            if event.text == "s" || event.text == "S" { CreateArea.key("s"); return accept; }
+            if event.text == "i" || event.text == "I" { CreateArea.key("i"); return accept; }
+            if event.text == "o" || event.text == "O" { CreateArea.key("o"); return accept; }
+            if event.text == "j" || event.text == "J" { CreateArea.key("j"); return accept; }
+            if event.text == "k" || event.text == "K" { CreateArea.key("k"); return accept; }
+            if event.text == "l" || event.text == "L" { CreateArea.key("l"); return accept; }
+            if event.text == Key.LeftArrow || event.text == Key.RightArrow {
+                CreateArea.key("step:" + (event.text == Key.LeftArrow ? -1 : 1) * (event.modifiers.shift ? 10 : 1));
+                return accept;
+            }
+            if event.text >= "1" && event.text <= "9" && event.text.character-count == 1 {
+                CreateArea.key("angle:" + event.text);
+                return accept;
+            }
+            if event.text == Key.Escape { CreateArea.key("clear"); return accept; }
+            if event.text == Key.Backspace || event.text == Key.Delete { CreateArea.key("delete"); return accept; }
+            reject
+        }
+        EditorView {
+            width: parent.width;
+            height: parent.height;
+        }
     }
 }

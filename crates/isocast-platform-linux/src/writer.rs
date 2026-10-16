@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use isocast_engine::{FileWriter, MOVIE_FRAGMENT_SECONDS, SAMPLE_RATE, Time, WriterSpec};
+use isocast_engine::{FileWriter, Finished, MOVIE_FRAGMENT_SECONDS, SAMPLE_RATE, Time, WriterSpec};
 use isocast_protocol::{Codec, Container};
 
 use crate::frames::{Frame, Layout};
@@ -397,7 +397,7 @@ impl FileWriter for Writer {
         Ok(true)
     }
 
-    fn finish(mut self, end: Time) -> Result<u64> {
+    fn finish(mut self, end: Time) -> Result<Finished> {
         self.check_errors()?;
         let end_at = self.file_time(end)?;
         let last_slot = end_at - self.frame_duration();
@@ -447,7 +447,10 @@ impl FileWriter for Writer {
             .set_state(gst::State::Null)
             .context("could not close the file")?;
         self.finished = true;
-        Ok(repeated)
+        Ok(Finished {
+            repeated,
+            ..Finished::default()
+        })
     }
 
     fn cancel(mut self) {

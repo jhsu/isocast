@@ -634,13 +634,23 @@ impl Daemon {
                     }
                 }
                 "recording.split" => Method::Split,
-                "streaming.start" => Method::StreamStart,
-                "streaming.stop" => Method::StreamStop,
+                "streaming.start" => Method::StreamStart(None),
+                "streaming.stop" => Method::StreamStop(None),
                 "streaming.toggle" => {
                     if self.state.lock().unwrap().streaming() {
-                        Method::StreamStop
+                        Method::StreamStop(None)
                     } else {
-                        Method::StreamStart
+                        Method::StreamStart(None)
+                    }
+                }
+                "replay.start" => Method::ReplayStart,
+                "replay.stop" => Method::ReplayStop,
+                "replay.save" => Method::ReplaySave,
+                "replay.toggle" => {
+                    if self.state.lock().unwrap().replay.active() {
+                        Method::ReplayStop
+                    } else {
+                        Method::ReplayStart
                     }
                 }
                 "transition.take" => Method::Take { transition: None },

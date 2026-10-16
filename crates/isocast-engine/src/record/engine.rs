@@ -34,13 +34,13 @@ use super::scenes::{SceneInput, SceneThread};
 use super::shared_frames::{self, SharedFeed};
 use super::timings::CompositorTimings;
 use super::{
-    AUDIO_TAIL, CaptureReport, DiskReport, FIRST_FRAME_TIMEOUT, FolderLock, Formats,
-    MIN_FREE_BYTES, MIN_FREE_SECONDS, MIN_TAKE, MIX_QUEUE_DEPTH, MONITOR_FPS, OnAir, Output,
-    Packet, QUEUE_DEPTH, RecordOptions, Report, SPACE_CHECK_INTERVAL, SPEED_MARGIN, SPLIT_LEAD,
-    SPLIT_SOON_LEAD, START_DELAY, STATUS_INTERVAL, SessionControl, Shared, Slots, SourceFilters,
-    SplitRefused, SplitTake, SplitTiming, Take, create_writers, expand_home, interrupted_note,
-    interrupted_sessions, live_status, plan_take, sidechain_sources, take_manifest, wait_for_frame,
-    write_manifest,
+    AUDIO_TAIL, COMMIT_TIMEOUT, CaptureReport, DiskReport, FIRST_FRAME_TIMEOUT, FilePlan,
+    FolderLock, Formats, MIN_FREE_BYTES, MIN_FREE_SECONDS, MIN_TAKE, MIX_QUEUE_DEPTH, MONITOR_FPS,
+    OnAir, Output, Packet, QUEUE_DEPTH, RecordOptions, Report, SPACE_CHECK_INTERVAL, SPEED_MARGIN,
+    SPLIT_LEAD, SPLIT_SOON_LEAD, START_DELAY, STATUS_INTERVAL, SessionControl, Shared, Slots,
+    SourceFilters, SplitRefused, SplitTake, SplitTiming, Take, create_writers, expand_home,
+    interrupted_note, interrupted_sessions, live_status, plan_take, sidechain_sources,
+    take_manifest, wait_for_frame, write_manifest, write_manifest_durable,
 };
 use crate::audio_filter::AudioStage;
 use crate::gpu::Gpu;
@@ -281,6 +281,57 @@ impl<F: Clone> Drop for ProgramTap<F> {
     }
 }
 
+/// A way to re-tap the program without keeping a route (and the compositor)
+/// active. This keeps the inner state, not the Engine: dropping the Engine
+/// still stops it, which a parked encoder can observe without a receiver.
+#[derive(Clone)]
+pub(crate) struct ProgramTapSource<P: Platform>(Arc<Inner<P>>);
+
+impl<P: Platform> ProgramTapSource<P> {
+    pub(crate) fn stopped(&self) -> bool {
+        self.0.stopping.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn tap(
+        &self,
+        depth: usize,
+        missed_audio_chunks: Arc<AtomicU64>,
+    ) -> ProgramTap<P::Frame> {
+        let inner = &self.0;
+        // Serialize acquiring the canvas with update's refusal check.
+        let _state = inner.state.lock().unwrap();
+        let (tx, packets) = sync_channel(depth);
+        let from = inner.platform.now();
+        let missed_frames = Arc::new(AtomicU64::new(0));
+        let keys = (
+            inner.program_video.add_counted(
+                tx.clone(),
+                0,
+                from,
+                None,
+                Some(missed_frames.clone()),
+                false,
+            ),
+            inner.program_audio.add_counted(
+                tx,
+                0,
+                from,
+                None,
+                Some(missed_audio_chunks.clone()),
+                false,
+            ),
+        );
+        ProgramTap {
+            packets,
+            missed_frames,
+            missed_audio_chunks,
+            video: inner.program_video.clone(),
+            audio: inner.program_audio.clone(),
+            keys,
+        }
+    }
+}
+
 /// A running engine. Dropping it stops everything.
 pub struct Engine<P: Platform> {
     inner: Arc<Inner<P>>,
@@ -341,6 +392,9 @@ struct Inner<P: Platform> {
     timings: Mutex<CompositorTimings>,
     /// Measured write speeds by folder, and when.
     speeds: Mutex<HashMap<PathBuf, (Time, f64)>>,
+    /// The program's shared H.264/AAC encoders (the stream's and the
+    /// replay buffer's).
+    encoders: crate::stream::encoder::Encoders,
 }
 
 struct State<P: Platform> {
@@ -567,6 +621,7 @@ impl<P: Platform> Engine<P> {
             program_fps: AtomicU64::new(0),
             timings: Mutex::default(),
             speeds: Mutex::new(HashMap::new()),
+            encoders: Default::default(),
         });
         reconcile(&inner, setup);
 
@@ -1033,37 +1088,17 @@ impl<P: Platform> Engine<P> {
     /// The program's frames and mix for an output like a stream, from the
     /// next frame on, queueing up to `depth` packets.
     pub fn tap_program(&self, depth: usize) -> ProgramTap<P::Frame> {
-        let inner = &self.inner;
-        let (tx, packets) = sync_channel(depth);
-        let from = inner.platform.now();
-        let missed_frames = Arc::new(AtomicU64::new(0));
-        let missed_audio_chunks = Arc::new(AtomicU64::new(0));
-        let keys = (
-            inner.program_video.add_counted(
-                tx.clone(),
-                0,
-                from,
-                None,
-                Some(missed_frames.clone()),
-                false,
-            ),
-            inner.program_audio.add_counted(
-                tx,
-                0,
-                from,
-                None,
-                Some(missed_audio_chunks.clone()),
-                false,
-            ),
-        );
-        ProgramTap {
-            packets,
-            missed_frames,
-            missed_audio_chunks,
-            video: inner.program_video.clone(),
-            audio: inner.program_audio.clone(),
-            keys,
-        }
+        self.program_tap_source()
+            .tap(depth, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub(crate) fn program_tap_source(&self) -> ProgramTapSource<P> {
+        ProgramTapSource(self.inner.clone())
+    }
+
+    /// The program's shared encoders, for outputs that take it compressed.
+    pub(crate) fn encoders(&self) -> &crate::stream::encoder::Encoders {
+        &self.inner.encoders
     }
 
     /// Whether a recording is running.
@@ -1079,7 +1114,7 @@ impl<P: Platform> Engine<P> {
         if inner.recording.swap(true, Ordering::SeqCst) {
             bail!("already recording; stop the current recording first");
         }
-        let result = isocast_diagnostics::contain("recording", || record(inner, options))
+        let result = isocast_diagnostics::contain("recording", || record(self, options))
             .map_err(anyhow::Error::msg)
             .and_then(|r| r);
         {
@@ -1150,7 +1185,7 @@ fn needed_sources(setup: &Setup) -> Vec<String> {
         ids.extend(
             iso.sources
                 .iter()
-                .chain(iso.audio.iter().flatten())
+                .chain(iso.listed_audio())
                 .map(String::as_str),
         );
     }
@@ -1176,8 +1211,8 @@ fn canvas_refusal<P: Platform>(inner: &Inner<P>, current: &Canvas, new: &Canvas)
     let canvas = |c: &Canvas| (c.width, c.height, c.fps);
     (canvas(current) != canvas(new) && !inner.program_video.is_empty()).then(|| {
         format!(
-            "the canvas stays {}×{} at {} fps while recording or streaming; change it once \
-             they stop",
+            "the canvas stays {}×{} at {} fps while recording, streaming or keeping a replay \
+             buffer; change it once they stop",
             current.width, current.height, current.fps
         )
     })
@@ -2370,7 +2405,8 @@ fn drop_percent(dropped: u64, expected: u64) -> String {
     }
 }
 
-fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result<Report> {
+fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Report> {
+    let inner = &engine.inner;
     let platform = &inner.platform;
     let control = &inner.control;
     let setup = inner.state.lock().unwrap().setup.clone();
@@ -2413,7 +2449,7 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
         required.extend(
             iso.sources
                 .iter()
-                .chain(iso.audio.iter().flatten())
+                .chain(iso.listed_audio())
                 .map(String::as_str),
         );
     }
@@ -2439,12 +2475,10 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
             for id in &required {
                 // Which list makes the recording need it, for the way out.
                 let has = |list: &[String]| list.iter().any(|s| s == id);
-                let list = if iso_enabled && has(&iso.sources) {
-                    "recording.iso.sources"
-                } else if iso_enabled && has(iso.audio.as_deref().unwrap_or(&[])) {
-                    "recording.iso.audio"
-                } else {
-                    "recording.program.audio"
+                let list = match iso.audio_field(id) {
+                    _ if iso_enabled && has(&iso.sources) => "recording.iso.sources".into(),
+                    Some(field) if iso_enabled => field,
+                    _ => "recording.program.audio".to_string(),
                 };
                 let why = match state.sources.get(*id) {
                     Some(live) if reopening(id, live) => {
@@ -2515,14 +2549,28 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
                 ));
             }
         }
+        // A listed audio source that turned out to have no sound (a media
+        // file without an audio track) is left out of the files, never
+        // failing the take (#75).
+        if iso_enabled {
+            let mut warned = HashSet::new();
+            for id in iso.listed_audio() {
+                if !formats.audio.contains_key(id) && warned.insert(id) {
+                    let field = iso
+                        .audio_field(id)
+                        .unwrap_or_else(|| "recording.iso.audio".into());
+                    warnings.push(format!(
+                        "{id} has no sound (its file has no audio track), so the ISO files \
+                         record without it; take it out of {field}"
+                    ));
+                }
+            }
+        }
         // Keep the recorded sources as they are until the recording ends.
         if iso_enabled {
-            state.pins.extend(
-                iso.sources
-                    .iter()
-                    .chain(iso.audio.iter().flatten())
-                    .cloned(),
-            );
+            state
+                .pins
+                .extend(iso.sources.iter().chain(iso.listed_audio()).cloned());
         }
     }
     let first = plan_take(setup, &formats, &folder, 1)?;
@@ -2614,6 +2662,34 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
 
     // Stopped while getting ready (sources opening, the disk test): no
     // files yet, so nothing to finish.
+    if options.stop.load(Ordering::SeqCst) {
+        bail!("the recording was stopped before it started, so nothing was recorded");
+    }
+    // VideoToolbox places sessions on their first picture. Reserve the shared
+    // stream/replay encoder before starting the recording writers, even when
+    // the live output will only join later (#68). No output configured: no cost.
+    let _warm = if setup.stream.is_some() || !setup.recording.replay.is_default() {
+        let spec =
+            crate::replay::encoder_spec(engine, &setup.recording.replay, setup.stream.as_ref());
+        match inner.encoders.warm(engine, &spec, &options.stop) {
+            Ok(subscription) => Some(subscription),
+            Err(error) => {
+                // A missing optional H.264 encoder must not prevent an otherwise
+                // valid recording (for example ProRes on a hosted Mac).
+                warnings.push(format!(
+                    "could not prepare the live encoder before recording: {error:#}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Stream destinations with their own bitrate or size have encoders of
+    // their own (#73): place those too, so one starting mid-recording
+    // joins a placed session rather than stalling the writers.
+    let _warm_destinations =
+        crate::stream::warm_destinations(engine, setup, &options.stop, &mut warnings);
     if options.stop.load(Ordering::SeqCst) {
         bail!("the recording was stopped before it started, so nothing was recorded");
     }
@@ -2799,6 +2875,8 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
             .collect();
 
         let mut all_started = false;
+        // A pause's commit barrier under way: its generation, cut and deadline.
+        let mut pending_commit: Option<(u64, Time, Time)> = None;
         let disk_probe = DiskProbe::start(platform, &folder);
         let mut disk_meter = DiskMeter::default();
         let mut losses = 0;
@@ -2859,12 +2937,99 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
                     on_status(&status);
                 }
                 // Markers and scene switches go into the manifest right away.
-                if let Some(generation) = control.take_changed() {
-                    let result = write(current, SessionStatus::Recording, &[]);
+                // A pause of crash-safe files first has every file commit what
+                // it holds up to the cut, so its checkpoint states a fact:
+                // the saved timeline up to which every file is on disk.
+                let checkpoint = |generation: u64, errors: &[String], durable: bool| {
+                    let result = if durable {
+                        write_manifest_durable(
+                            &current.manifest_path,
+                            &take_manifest(
+                                platform,
+                                setup,
+                                current,
+                                SessionStatus::Recording,
+                                errors,
+                                Some(control),
+                            ),
+                        )
+                    } else {
+                        write(current, SessionStatus::Recording, errors)
+                    };
                     let mut state = control.state.lock().unwrap();
                     state.manifest_error = result.err().map(|e| format!("{e:#}"));
                     if state.manifest_error.is_none() {
                         state.saved_pause_generation = generation;
+                    }
+                };
+                if let Some(generation) = control.take_changed() {
+                    let barrier = clock.open_pause().filter(|_| {
+                        pending_commit.is_none()
+                            && current
+                                .plans
+                                .iter()
+                                .any(|p| p.crash_safe.load(Ordering::Acquire))
+                    });
+                    match barrier {
+                        Some(at) => {
+                            for plan in &current.plans {
+                                if plan.crash_safe.load(Ordering::Acquire) {
+                                    plan.commit_at.store(at.as_nanos(), Ordering::Relaxed);
+                                    plan.commit_requested.store(generation, Ordering::Release);
+                                }
+                            }
+                            pending_commit = Some((generation, at, now + COMMIT_TIMEOUT));
+                        }
+                        None => checkpoint(generation, &[], false),
+                    }
+                }
+                if let Some((generation, at, deadline)) = pending_commit {
+                    let committed: Vec<&Arc<FilePlan>> = current
+                        .plans
+                        .iter()
+                        .filter(|p| p.crash_safe.load(Ordering::Acquire))
+                        .collect();
+                    let all = committed
+                        .iter()
+                        .all(|p| p.commit_done.load(Ordering::Acquire) >= generation);
+                    // A file whose commit failed answers at once, with its
+                    // error; one that never answers is reported at the
+                    // deadline. Neither leaves this pause with a number.
+                    let mut errors: Vec<String> = committed
+                        .iter()
+                        .filter(|p| p.commit_failed.load(Ordering::Acquire) >= generation)
+                        .filter_map(|p| p.commit_error.lock().unwrap().clone())
+                        .collect();
+                    let failed = !errors.is_empty();
+                    if all || failed || now >= deadline || shared.end() != Time::MAX {
+                        if !all && !failed {
+                            for plan in committed
+                                .iter()
+                                .filter(|p| p.commit_done.load(Ordering::Acquire) < generation)
+                            {
+                                errors.push(format!(
+                                    "{}: did not confirm its commit within {} s of the pause; \
+                                     nothing durable is promised for it at this pause",
+                                    plan.spec.path.display(),
+                                    COMMIT_TIMEOUT.as_secs()
+                                ));
+                            }
+                        }
+                        let recoverable = if all && !failed {
+                            let cuts = clock.state.read().unwrap();
+                            committed
+                                .iter()
+                                .map(|p| p.recoverable(current.epoch, &cuts))
+                                .try_fold(f64::INFINITY, |min, r| r.map(|r| min.min(r)))
+                                .filter(|r| r.is_finite())
+                        } else {
+                            None
+                        };
+                        clock.set_recoverable(at, recoverable);
+                        control.state.lock().unwrap().pause_outcome =
+                            Some((generation, recoverable, errors.clone()));
+                        checkpoint(generation, &errors, true);
+                        pending_commit = None;
                     }
                 }
                 if !all_started
