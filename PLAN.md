@@ -1401,6 +1401,17 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 
 ## Log
 
+- Engine hardening (#27/#30/#31/#35, 2026-10-16): explicit critical-state
+  recovery replaces lock poisoning; the monitor callback is lock/heap-free;
+  AVAssetWriter append exceptions are contained and both VT session types
+  drain before invalidation. Live tap video is bounded separately from
+  audio, with counted oldest-picture eviction; aggregate pool/capture-ISO
+  isolation (#27) remains open. Hosted e2e 16/16 and M2-b strict smoke 5/5,
+  zero drops in three interleaved flagship A/Bs, CPU 26.3% main / 26.1% head.
+  Panic and native teardown evidence in hardening/scratch/REPORT.md; review
+  and re-review found no blocker. Final merged-main gates and monitor-hour
+  result are recorded in that report.
+
 - A.4 / #82 (2026-10-16): a microphone whose driver stops answering no
   longer leaves "previous open is still pending" until macOS returns. Test
   VM with coreaudiod stopped 40 s, base vs head: base repeats Ryan's

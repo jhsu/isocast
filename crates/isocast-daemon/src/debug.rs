@@ -7,8 +7,8 @@
 //! so a restarted isocastd keeps counting towards the auto-off instead of
 //! starting again.
 
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use isocast_diagnostics::{developer, emit, emit_developer, set_developer};
@@ -40,7 +40,7 @@ pub(crate) fn start(daemon: &Daemon) {
 
 /// The profile's setting.
 fn settings(daemon: &Daemon) -> (DeveloperSettings, Option<String>) {
-    let state = daemon.state.lock().unwrap();
+    let state = daemon.state.read();
     (
         state
             .setup
@@ -54,7 +54,7 @@ fn settings(daemon: &Daemon) -> (DeveloperSettings, Option<String>) {
 /// Make the gate follow the profile's setting (after any setup change).
 pub(crate) fn sync(daemon: &Daemon, reason: &str) {
     let (settings, profile) = settings(daemon);
-    let mut since = SINCE.lock().unwrap();
+    let mut since = SINCE.lock();
     match (settings.enabled, since.is_some()) {
         (true, false) => {
             // A restarted isocastd keeps the time it was turned on.
@@ -82,7 +82,7 @@ pub(crate) fn sync(daemon: &Daemon, reason: &str) {
         (false, true) | (false, false) if developer() || since.is_some() => {
             *since = None;
             set_developer(false);
-            *LAST_TRACE.lock().unwrap() = None;
+            *LAST_TRACE.lock() = None;
             let _ = std::fs::remove_file(since_file());
             emit(
                 "info",
@@ -124,14 +124,14 @@ pub(crate) fn set(daemon: &Daemon, params: DebugSetParams) -> Result<DeveloperSt
     }
     if params.enabled == Some(true) {
         // Turning it on (again) starts its auto-off time afresh.
-        *SINCE.lock().unwrap() = None;
+        *SINCE.lock() = None;
         let _ = std::fs::remove_file(since_file());
     }
     // Another client's change can land between reading the revision and
     // applying: read it again and retry, rather than fail the toggle.
     for attempt in 1.. {
         let (revision, current) = {
-            let state = daemon.state.lock().unwrap();
+            let state = daemon.state.read();
             let setup = state
                 .setup
                 .as_ref()
@@ -164,7 +164,7 @@ pub(crate) fn set(daemon: &Daemon, params: DebugSetParams) -> Result<DeveloperSt
 
 pub(crate) fn status(daemon: &Daemon) -> DeveloperStatus {
     let (settings, profile) = settings(daemon);
-    let since = *SINCE.lock().unwrap();
+    let since = *SINCE.lock();
     let folder = isocast_diagnostics::logs_folder();
     let log_bytes = isocast_diagnostics::files(&folder)
         .iter()
@@ -188,7 +188,7 @@ pub(crate) fn status(daemon: &Daemon) -> DeveloperStatus {
         log_bytes,
         log_budget_bytes: isocast_diagnostics::DEVELOPER_BUDGET,
         memory_bytes: memory_bytes(),
-        trace: LAST_TRACE.lock().unwrap().clone(),
+        trace: LAST_TRACE.lock().clone(),
     }
 }
 
@@ -196,7 +196,7 @@ pub(crate) fn status(daemon: &Daemon) -> DeveloperStatus {
 /// it off when its time is up, and write the trace.
 pub(crate) fn tick(daemon: &Daemon, status: &Status) {
     sync(daemon, "profile");
-    let since = *SINCE.lock().unwrap();
+    let since = *SINCE.lock();
     let (settings, _) = settings(daemon);
     if let Some(since) = since
         && settings.auto_off_hours > 0
@@ -231,7 +231,7 @@ pub(crate) fn tick(daemon: &Daemon, status: &Status) {
     }
     let (outputs, starts) = isocast_engine::trace::drain();
     let Some(engine) = &status.engine else {
-        *LAST_TRACE.lock().unwrap() = None;
+        *LAST_TRACE.lock() = None;
         return;
     };
     let clocks: Vec<Value> = engine
@@ -262,7 +262,7 @@ pub(crate) fn tick(daemon: &Daemon, status: &Status) {
         "memory_bytes": memory_bytes(),
     });
     emit_developer("info", "trace", "frame timing", record.clone());
-    *LAST_TRACE.lock().unwrap() = Some(record);
+    *LAST_TRACE.lock() = Some(record);
 }
 
 /// isocastd's memory as Activity Monitor shows it (its footprint).

@@ -3355,6 +3355,7 @@ dependencies = [
  "isocast-protocol",
  "isocast-surfaces",
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
 ]
@@ -3387,6 +3388,7 @@ dependencies = [
  "libc",
  "native-tls",
  "nnnoiseless",
+ "parking_lot",
  "png",
  "resvg",
  "serde",
@@ -3402,6 +3404,7 @@ version = "0.0.5"
 dependencies = [
  "base64 0.22.1",
  "isocast-protocol",
+ "parking_lot",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -3462,6 +3465,7 @@ dependencies = [
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
  "objc2-web-kit",
+ "parking_lot",
  "security-framework",
  "serde_json",
  "wgpu",
