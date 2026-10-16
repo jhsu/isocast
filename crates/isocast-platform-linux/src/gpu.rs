@@ -2,6 +2,7 @@
 //! filled in memory, and copies back of frames the GPU drew.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2);
 /// Importers whose textures a frame keeps at once (the program, ISO
 /// converters, monitors); the least recently used beyond this go.
 const MAX_IMPORTERS_PER_FRAME: usize = 4;
+
+/// Texture sets an importer keeps from frames that are gone, for the next
+/// frames of the same shape.
+const MAX_SPARE: usize = 8;
 
 /// How the engine's Y'CbCr frames encode colour.
 const VIDEO_709: YCbCr = YCbCr {
@@ -34,6 +39,24 @@ pub(crate) struct Planes {
     textures: Vec<wgpu::Texture>,
     /// The frame version the textures hold, if any.
     pub version: Option<u64>,
+    /// Where the textures go when the frame lets go of them.
+    shape: (Layout, u32, u32),
+    spare: Spare,
+}
+
+/// Textures of frames gone, by shape. Captures make a new frame for every
+/// picture: making and freeing a 4K screen's texture 60 times a second
+/// outran wgpu's freeing (the daemon's VRAM grew by about 1 GB/s while it
+/// drew the program, until the GPU ran out), so they are reused instead.
+type Spare = Arc<Mutex<Vec<((Layout, u32, u32), Vec<wgpu::Texture>)>>>;
+
+impl Drop for Planes {
+    fn drop(&mut self) {
+        let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < MAX_SPARE {
+            spare.push((self.shape, std::mem::take(&mut self.textures)));
+        }
+    }
 }
 
 /// The texture format, size and bytes per texel of each plane.
@@ -59,6 +82,7 @@ fn plane_shapes(
 pub struct Importer {
     id: u64,
     gpu: Gpu,
+    spare: Spare,
 }
 
 impl Importer {
@@ -67,6 +91,7 @@ impl Importer {
         Self {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             gpu: gpu.clone(),
+            spare: Spare::default(),
         }
     }
 
@@ -77,7 +102,42 @@ impl Importer {
             state.planes[..=index].rotate_right(1);
             return 0;
         }
-        let textures = plane_shapes(frame.layout(), frame.width(), frame.height())
+        let shape = (frame.layout(), frame.width(), frame.height());
+        let reused = {
+            let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+            spare
+                .iter()
+                .position(|(kept, _)| *kept == shape)
+                .map(|index| spare.swap_remove(index).1)
+        };
+        let textures = reused.unwrap_or_else(|| self.textures(shape));
+        state.planes.insert(
+            0,
+            Planes {
+                importer: self.id,
+                device: self.gpu.device.clone(),
+                queue: self.gpu.queue.clone(),
+                textures,
+                version: None,
+                shape,
+                spare: self.spare.clone(),
+            },
+        );
+        // Drop the least recently used stale textures, never the new ones
+        // or any holding the current picture.
+        while state.planes.len() > MAX_IMPORTERS_PER_FRAME {
+            let current = Some(state.version);
+            let Some(stale) = state.planes[1..].iter().rposition(|p| p.version != current) else {
+                break;
+            };
+            state.planes.remove(stale + 1);
+        }
+        0
+    }
+
+    /// New textures for a frame of `shape`.
+    fn textures(&self, (layout, width, height): (Layout, u32, u32)) -> Vec<wgpu::Texture> {
+        plane_shapes(layout, width, height)
             .into_iter()
             .map(|(format, width, height, _)| {
                 self.gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -98,27 +158,7 @@ impl Importer {
                     view_formats: &[],
                 })
             })
-            .collect();
-        state.planes.insert(
-            0,
-            Planes {
-                importer: self.id,
-                device: self.gpu.device.clone(),
-                queue: self.gpu.queue.clone(),
-                textures,
-                version: None,
-            },
-        );
-        // Drop the least recently used stale textures, never the new ones
-        // or any holding the current picture.
-        while state.planes.len() > MAX_IMPORTERS_PER_FRAME {
-            let current = Some(state.version);
-            let Some(stale) = state.planes[1..].iter().rposition(|p| p.version != current) else {
-                break;
-            };
-            state.planes.remove(stale + 1);
-        }
-        0
+            .collect()
     }
 
     /// The textures the GPU is about to draw `frame` into.
