@@ -38,6 +38,9 @@ use objc2_io_surface::{
 
 use crate::{MAX_SLOTS, Token};
 
+/// How the daemon says it hands surfaces over (`SharedFrameStream::transport`).
+pub const TRANSPORT: &str = "iosurface-mach";
+
 /// `msgh_id`s of the service's messages.
 const REQUEST: i32 = 0x1500_ca51;
 const REPLY: i32 = REQUEST + 1;

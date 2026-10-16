@@ -34,4 +34,8 @@ isocast-surfaces = { path = "../isocast-surfaces" }
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# `frames --shared` reads the daemon's shared surfaces back through Vulkan.
+isocast-client = { path = "../isocast-client", features = ["wgpu"] }
 isocast-platform-linux = { path = "../isocast-platform-linux" }
+isocast-surfaces = { path = "../isocast-surfaces" }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }

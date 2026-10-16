@@ -1813,10 +1813,13 @@ pub struct SharedFramesParams {
 pub struct SharedFrameStream {
     pub target: String,
     /// How surfaces are handed over: `iosurface-mach` (macOS: IOSurfaces
-    /// as Mach send rights from the Mach service `service`).
+    /// as Mach send rights from the Mach service `service`) or `vulkan-fd`
+    /// (Linux: Vulkan memory as file descriptors from the abstract Unix
+    /// socket `service`).
     pub transport: String,
     /// Where the client fetches each ring's surfaces: on macOS the daemon's
-    /// Mach service name in the client's bootstrap namespace.
+    /// Mach service name in the client's bootstrap namespace, on Linux the
+    /// name of its abstract socket.
     pub service: String,
     /// The surfaces' pixel format: `rgba8unorm` (Rec. 709 primaries and
     /// transfer, as the canvas; not sRGB-decoded by the GPU).

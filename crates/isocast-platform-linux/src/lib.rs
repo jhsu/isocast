@@ -296,11 +296,18 @@ impl Platform for LinuxPlatform {
 
     fn shared_surface(
         &self,
-        _gpu: &Gpu,
-        _width: u32,
-        _height: u32,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
     ) -> anyhow::Result<(isocast_surfaces::Surface, wgpu::Texture)> {
-        not_yet("live monitors in other apps", "L.6")
+        // TEXTURE_BINDING: each finished picture is left ready for sampling,
+        // the layout clients expect it in (see isocast-surfaces' linux.rs).
+        isocast_surfaces::Surface::with_texture(
+            &gpu.device,
+            width,
+            height,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        )
     }
 
     fn encode_jpeg(

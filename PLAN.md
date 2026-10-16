@@ -1385,6 +1385,8 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
   by `isocast devices`.
 - [x] **L.4** Cameras through V4L2.
 - [x] **L.5** Screens through the xdg screen-cast portal and PipeWire.
+- [x] **L.6a** Shared frames: the app's monitors on Linux, zero-copy
+  (Vulkan memory exported as fds, handed over an abstract Unix socket).
 - [ ] **L.6** Media files, live H.264/AAC encoders (streaming), JPEG
   monitors, joining takes, the secret store, per-app audio, leaving our
   own monitoring out of system audio, and windows and apps (the portal
@@ -1400,6 +1402,18 @@ Zero-copy DMA-BUF later. Needs `gst-libav` (AAC) installed.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.6a (2026-10-16): the Slint app's monitors work on Linux: isocastd
+  draws each monitor into Vulkan images whose memory it exports as opaque
+  fds (`isocast-surfaces` linux.rs), handed to the app over an abstract
+  Unix socket with SCM_RIGHTS; the app imports them into its own Vulkan
+  device. Also fixes the Linux importer making a new texture for every
+  captured frame (VRAM grew ~1 GB/s while the program was drawn, until the
+  compositor ran out). Verified on Joe's RTX 4070 Ti SUPER (niri): `isocast
+  frames --shared --check` 449/449 frames whole at 30 fps (960×540) and
+  299/299 at 60 fps with 2 slots, camera 87/87; `isocast-ui --bench 12`
+  786 frames received and shown, 0 lost, preview 60 fps; offscreen
+  snapshots show both studio monitors; daemon VRAM flat at ~600 MB.
 
 - Engine hardening (#27/#30/#31/#35, 2026-10-16): explicit critical-state
   recovery replaces lock poisoning; the monitor callback is lock/heap-free;

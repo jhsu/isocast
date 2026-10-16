@@ -366,6 +366,11 @@ each section. Delete entries that stop being true.
 
 ## Ready for Ryan
 
+- 2026-10-16 (L.6a): **The app shows live monitors on Linux.** Try:
+  `cargo build && ISOCAST_DAEMON=$PWD/target/debug/isocastd
+  ./target/debug/isocast-ui` (previews are `--preview image`, the default
+  off macOS).
+
 - 2026-10-15 (L.1–L.5): **Isocast records on Linux** (Joe's CachyOS + niri,
   RTX 4070 Ti SUPER): screens, cameras, microphones, system audio and
   synthetic sources, in-process and through the daemon. Needs GStreamer
@@ -1782,6 +1787,20 @@ each section. Delete entries that stop being true.
   file names use, so every file of a take shares it; it is written into the
   fragmented `moov` at creation and read back from there by `recover`, so a
   repaired file keeps it. AVFoundation reads it as `creationDate`.
+
+- 2026-10-16 (L.6a): **Linux shared frames are Vulkan opaque fds**, not
+  DMA-BUFs: daemon and app are both ours, on the same GPU and driver
+  (checked by device/driver UUID before importing), so no DRM format
+  modifiers to negotiate (niri on NVIDIA already makes those painful).
+  Each surface is a dedicated, exportable R8G8B8A8 image made through
+  wgpu-hal's Vulkan device (ash 0.38, wgpu-hal's own); the fds go over an
+  abstract socket `@isocastd.<pid>.surfaces` (nothing on disk, gone with
+  the process; SO_PEERCRED limits it to our user, the token to the
+  viewer). Between hand-overs an image stays in the sampling layout: the
+  viewer thread transitions it to `TextureUses::RESOURCE` after drawing
+  (only for targets with TEXTURE_BINDING, so macOS is unchanged) and the
+  app wraps it in that state. A memfd (CPU copy) fallback for mismatched
+  GPUs isn't built yet.
 
 - 2026-10-15 (Joe, L): **Linux backend on GStreamer** (`gstreamer-rs`
   0.25): capture, NVENC/VA-API/x264 encoding and fragmented MOV/MP4 in
@@ -5395,6 +5414,23 @@ each section. Delete entries that stop being true.
   it in before). Run with `ISOCAST_DAEMON=$PWD/target/debug/isocastd`.
   `clippy -D warnings` still fails on Linux, on dead code in the daemon's
   `diagnostics.rs`/`plugins.rs` and one CLI struct, from macOS-only paths.
+- 2026-10-16 (L.6a): **Linux captures make a new frame per picture**
+  (`Frame::from_pixels`), so the importer made a new texture for each:
+  33 MB per 4K screen frame at 60 fps, freed lazily by wgpu, so VRAM grew
+  ~1 GB/s whenever the program was drawn (recordings too) and the
+  compositor hit "Out of Memory" at 16 GB. The importer now keeps up to 8
+  texture sets of dropped frames and reuses them by shape (gpu.rs
+  `Spare`). The engine keeps a frame alive while its textures are drawn,
+  so reuse after drop is safe.
+- 2026-10-16: `isocast frames --shared --touch` fails on Linux: the empty
+  change returns the same revision, so no frame can show a new one. Not
+  the transport; not looked into.
+- 2026-10-16: after several daemon restarts, `isocast start` failed with
+  `source "screen": … 2 earlier opens are still waiting` (portal opens
+  that never answered); `frames --shared` on the program still worked.
+  Not looked into.
+- 2026-10-16: `scripts/snapshot.sh` uses BSD `sed -i ''`, which GNU sed
+  rejects; on Linux run its steps by hand (or use `sed -i.bak`).
 - 2026-10-15 (L.5): Linux screens go through the ScreenCast portal
   (`ashpd`, a 1-thread tokio runtime per session). The portal can't list
   displays, so they come from `wl_output` 4 (id = connector, like DP-3).

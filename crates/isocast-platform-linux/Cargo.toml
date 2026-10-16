@@ -18,8 +18,8 @@ gstreamer-app = "0.25.2"
 gstreamer-video = "0.25.4"
 isocast-engine = { path = "../isocast-engine" }
 isocast-protocol = { path = "../isocast-protocol" }
-# Its portable stand-in until Linux shares surfaces (DMA-BUF).
-isocast-surfaces = { path = "../isocast-surfaces" }
+# Monitors shared with clients as Vulkan memory (file descriptors).
+isocast-surfaces = { path = "../isocast-surfaces", features = ["wgpu"] }
 libc = "0.2"
 # The portal session runs on its own small runtime.
 serde_json = "1.0.154"

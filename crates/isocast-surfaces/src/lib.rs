@@ -11,6 +11,11 @@
 //! (see `isocast_protocol::api::shared`). docs/shared-frames.md explains
 //! the choice and the Windows design.
 //!
+//! On Linux a surface is a Vulkan image whose memory is exported as a file
+//! descriptor (`VK_KHR_external_memory_fd`); the descriptors of a ring go
+//! over an abstract Unix socket of the daemon's (`SCM_RIGHTS`), fetched the
+//! same way with a token ([`fetch`]).
+//!
 //! On other systems everything here returns an error saying so.
 
 use std::fmt;
@@ -19,13 +24,19 @@ use std::fmt;
 mod mac;
 
 #[cfg(target_os = "macos")]
-pub use mac::{Exporter, Surface, fetch, host_now};
+pub use mac::{Exporter, Surface, TRANSPORT, fetch, host_now};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::{Exporter, Surface, TRANSPORT, fetch, host_now};
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod other;
 
-#[cfg(not(target_os = "macos"))]
-pub use other::{Exporter, Surface, fetch, host_now};
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub use other::{Exporter, Surface, TRANSPORT, fetch, host_now};
 
 /// The most surfaces a ring may have.
 pub const MAX_SLOTS: usize = 8;

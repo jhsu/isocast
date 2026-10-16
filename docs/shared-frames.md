@@ -230,6 +230,33 @@ it. Moving the swatch with a live apply mid-run: every frame labelled with
 the old revision showed it in the old place, every frame with the new one
 in the new place. 90 short sessions left the daemon's memory flat.
 
+## Linux
+
+The same protocol with transport `vulkan-fd` (`crates/isocast-surfaces/src/linux.rs`):
+
+- **Surfaces.** A surface's memory belongs to a GPU device, so the
+  daemon makes each one with `Surface::with_texture(device, …)`: a
+  dedicated R8G8B8A8 Vulkan image (optimal tiling) whose memory is
+  exportable as an opaque fd (`VK_KHR_external_memory_fd`), wrapped as a
+  wgpu texture through wgpu-hal. The client makes an identical image and
+  imports a copy of the fd into its own device.
+- **Hand-over.** The daemon listens on the abstract Unix socket
+  `@isocastd.<pid>.surfaces` (the `service`), answering only its own user
+  (SO_PEERCRED). The client sends the token; the reply carries each
+  surface's size, memory size and GPU ids, with the fds attached
+  (SCM_RIGHTS).
+- **Same GPU only.** Opaque fds only open on the same device and driver;
+  the client compares UUIDs (`VkPhysicalDeviceIDProperties`) and says so
+  if they differ (for example a laptop's app on the integrated GPU and the
+  daemon on the discrete one).
+- **Layout.** Vulkan images have layouts that both processes must agree
+  on. After drawing a frame the viewer thread moves the image to the
+  sampling layout (`TextureUses::RESOURCE`), and the client wraps the
+  image in that state and only samples it.
+
+Verified 2026-10-16 on an RTX 4070 Ti SUPER (driver 615.78, niri):
+`isocast frames --shared --check` and `isocast-ui --bench`.
+
 ## Windows (design only)
 
 The same protocol, with D3D12 shared resources instead of IOSurfaces and

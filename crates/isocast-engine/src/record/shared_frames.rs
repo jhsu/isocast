@@ -328,7 +328,28 @@ fn run<P: Platform>(
             ScaleFilter::Bicubic
         };
         let target = &ring.surfaces[index].1;
-        let submission = renderer.render(&gpu, target, &[layer], size);
+        let mut submission = renderer.render(&gpu, target, &[layer], size);
+        // A target that can be sampled is left ready for it: on Linux the
+        // viewer's GPU expects the picture in that layout (Metal has none).
+        if target
+            .usage()
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        {
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("shared frame hand-over"),
+                });
+            encoder.transition_resources(
+                std::iter::empty(),
+                std::iter::once(wgpu::TextureTransition {
+                    texture: target,
+                    selector: None,
+                    state: wgpu::TextureUses::RESOURCE,
+                }),
+            );
+            submission = gpu.queue.submit([encoder.finish()]);
+        }
         // The viewer's GPU must read a finished picture.
         gpu.device
             .poll(wgpu::PollType::Wait {

@@ -7,6 +7,9 @@ use anyhow::{Result, bail};
 
 use crate::Token;
 
+/// No transport here.
+pub const TRANSPORT: &str = "none";
+
 const UNSUPPORTED: &str = "shared GPU surfaces are only available on macOS so far";
 
 /// A shared picture in GPU memory (not available on this system).
